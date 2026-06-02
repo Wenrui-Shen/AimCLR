@@ -1,0 +1,60 @@
+work_dir: /data/gty/AAAI_github/ntu60_cv/prc_bone/pretext
+
+# feeder
+train_feeder: feeder.ntu_feeder.Feeder_triple
+train_feeder_args:
+  data_path: ../data/pstl/xview/train_position.npy
+  label_path: ../data/pstl/xview/train_label.pkl
+  shear_amplitude: 0.5
+  temperal_padding_ratio: 6
+  mmap: True
+  return_index: True
+
+# model
+model: net.prc.PRC
+model_args:
+  base_encoder: net.st_gcn.Model
+  feature_dim: 128
+  mlp: True
+  in_channels: 3
+  hidden_channels: 16 # 1/4 x channels of standard stgcn
+  hidden_dim: 256
+  dropout: 0.5
+  graph_args:
+    layout: 'ntu-rgb+d'
+    strategy: 'spatial'
+  edge_importance_weighting: True
+
+# optim
+nesterov: False
+weight_decay: 1e-4
+base_lr: 0.1
+optimizer: SGD
+step: [250]
+
+# training
+device: [3]
+batch_size: 128
+test_batch_size: 128
+num_epoch: 300
+start_epoch: 0
+stream: 'bone'
+
+# progressive recursive clustering
+prc_mode: 'hard'
+prc_reassign: 1
+prc_force_root_split: True
+prc_kmeans_iters: 30
+prc_routing_temperature: 0.2
+prc_reassign_confidence: 0.0
+prc_entropy_weight: 0.05
+prc_entropy_floor: 0.35
+prc_leaf_variance_weight: 0.05
+prc_leaf_variance_eps: 0.01
+prc_entropy_min_samples: 8
+prc_seed: 0
+prc_save_tree: True
+
+# log
+save_interval: 5
+eval_interval: -1

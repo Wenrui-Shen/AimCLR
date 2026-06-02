@@ -7,9 +7,11 @@ from . import tools
 class Feeder_single(torch.utils.data.Dataset):
     """ Feeder for single inputs """
 
-    def __init__(self, data_path, label_path, shear_amplitude=0.5, temperal_padding_ratio=6, mmap=True):
+    def __init__(self, data_path, label_path, shear_amplitude=0.5, temperal_padding_ratio=6, mmap=True,
+                 return_index=False):
         self.data_path = data_path
         self.label_path = label_path
+        self.return_index = return_index
 
         self.shear_amplitude = shear_amplitude
         self.temperal_padding_ratio = temperal_padding_ratio
@@ -37,6 +39,8 @@ class Feeder_single(torch.utils.data.Dataset):
 
         # processing
         data = self._aug(data_numpy)
+        if self.return_index:
+            return data, label, index
         return data, label
 
     def _aug(self, data_numpy):
@@ -53,10 +57,11 @@ class Feeder_triple(torch.utils.data.Dataset):
     """ Feeder for triple inputs """
 
     def __init__(self, data_path, label_path, shear_amplitude=0.5, temperal_padding_ratio=6, mmap=True,
-                 aug_method='12345'):
+                 aug_method='12345', return_index=False):
         self.data_path = data_path
         self.label_path = label_path
         self.aug_method = aug_method
+        self.return_index = return_index
 
         self.shear_amplitude = shear_amplitude
         self.temperal_padding_ratio = temperal_padding_ratio
@@ -86,6 +91,8 @@ class Feeder_triple(torch.utils.data.Dataset):
         data1 = self._strong_aug(data_numpy)
         data2 = self._aug(data_numpy)
         data3 = self._aug(data_numpy)
+        if self.return_index:
+            return [data1, data2, data3], label, index
         return [data1, data2, data3], label
 
     def _aug(self, data_numpy):
@@ -121,9 +128,10 @@ class Feeder_semi(torch.utils.data.Dataset):
     """ Feeder for single inputs """
 
     def __init__(self, data_path, label_path, label_percent=0.1, shear_amplitude=0.5, temperal_padding_ratio=6,
-                 mmap=True):
+                 mmap=True, return_index=False):
         self.data_path = data_path
         self.label_path = label_path
+        self.return_index = return_index
 
         self.shear_amplitude = shear_amplitude
         self.temperal_padding_ratio = temperal_padding_ratio
@@ -177,6 +185,8 @@ class Feeder_semi(torch.utils.data.Dataset):
 
         # processing
         data = self._aug(data_numpy)
+        if self.return_index:
+            return data, label, index
         return data, label
 
     def _aug(self, data_numpy):
