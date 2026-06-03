@@ -64,6 +64,7 @@ class PRC_Processor(Processor):
         if self.arg.prc_mode == 'soft':
             self.prc_tree = None
             self.soft_leaf_scores = None
+            self.soft_leaf_masses = None
             self.soft_leaf_score_ids = None
             return
         num_samples = len(self.data_loader['train'].dataset)
@@ -435,15 +436,52 @@ class PRC_Processor(Processor):
 
         core = self._model_core()
         current_leaves = set(core.soft_leaf_ids)
-        candidates = [
-            (float(score), int(leaf_id))
-            for score, leaf_id in zip(self.soft_leaf_scores, self.soft_leaf_score_ids)
-            if int(leaf_id) in current_leaves
-        ]
+        leaf_depths = {
+            int(leaf_id): len(path)
+            for leaf_id, path in zip(core.soft_leaf_ids, core.soft_leaf_paths)
+        }
+        if self.soft_leaf_masses is None:
+            leaf_masses = np.zeros_like(self.soft_leaf_scores)
+        else:
+            leaf_masses = self.soft_leaf_masses
+        candidates = []
+        for score, mass, leaf_id in zip(self.soft_leaf_scores, leaf_masses,
+                                        self.soft_leaf_score_ids):
+            leaf_id = int(leaf_id)
+            if leaf_id not in current_leaves:
+                continue
+            mass = float(mass)
+            depth = int(leaf_depths.get(leaf_id, 0))
+            benefit = float(score)
+            depth_penalty = (
+                self.arg.prc_soft_grow_penalty_weight *
+                float(depth + 1) ** 2
+            )
+            small_leaf_penalty = (
+                self.arg.prc_soft_grow_small_leaf_penalty_weight /
+                max(mass, 1e-6)
+            )
+            penalty = depth_penalty + small_leaf_penalty
+            split_score = benefit - penalty
+            candidates.append({
+                'leaf_id': leaf_id,
+                'benefit': benefit,
+                'mass': mass,
+                'depth': depth,
+                'penalty': penalty,
+                'split_score': split_score,
+            })
         if not candidates:
             return
 
-        candidates.sort(reverse=True)
+        candidates.sort(key=lambda item: item['split_score'], reverse=True)
+        self.io.print_log(
+            'Soft PRC candidates epoch {} | {}'.format(
+                epoch,
+                ' | '.join(
+                    'leaf {leaf_id} score {split_score:.4f} benefit {benefit:.4f} pen {penalty:.4f} mass {mass:.3f} depth {depth}'.format(
+                        **candidate)
+                    for candidate in candidates[:5])))
         grow_count = max(1, int(self.arg.prc_soft_grow_leaves))
         if self.arg.prc_soft_max_leaves > 0:
             remaining = self.arg.prc_soft_max_leaves - len(core.soft_leaf_ids)
@@ -451,7 +489,23 @@ class PRC_Processor(Processor):
         if grow_count <= 0:
             return
 
-        leaf_ids = [leaf_id for _, leaf_id in candidates[:grow_count]]
+        leaf_ids = [
+            candidate['leaf_id']
+            for candidate in candidates
+            if (
+                candidate['split_score'] > 0 and
+                candidate['mass'] >= self.arg.prc_soft_grow_min_mass
+            )
+        ][:grow_count]
+        if not leaf_ids:
+            self.io.print_log(
+                'Soft PRC grow epoch {} | skipped | best_score {:.4f} | min_mass {:.3f}'.format(
+                    epoch, candidates[0]['split_score'],
+                    self.arg.prc_soft_grow_min_mass))
+            self.soft_leaf_scores = None
+            self.soft_leaf_masses = None
+            self.soft_leaf_score_ids = None
+            return
         new_modules, new_params = core.grow_soft_tree(
             leaf_ids, noise_scale=self.arg.prc_soft_split_noise)
         for module in new_modules:
@@ -464,7 +518,23 @@ class PRC_Processor(Processor):
                 'Soft PRC grow epoch {} | split leaves {} | leaves {} | internal {}'.format(
                     epoch, leaf_ids, len(core.soft_leaf_ids), len(core.soft_internal_ids)))
         self.soft_leaf_scores = None
+        self.soft_leaf_masses = None
         self.soft_leaf_score_ids = None
+
+    @staticmethod
+    def _sinkhorn_targets(scores, epsilon=0.05, niter=3):
+        """Balanced soft assignments with row sum 1 and near-uniform column mass."""
+        with torch.no_grad():
+            q = torch.exp((scores / max(float(epsilon), 1e-6)).t())
+            q = q / q.sum().clamp_min(1e-12)
+            k, b = q.size()
+            for _ in range(max(1, int(niter))):
+                q = q / q.sum(dim=1, keepdim=True).clamp_min(1e-12)
+                q = q / float(k)
+                q = q / q.sum(dim=0, keepdim=True).clamp_min(1e-12)
+                q = q / float(b)
+            q = q * float(b)
+            return q.t().contiguous()
 
     def _soft_tree_loss(self, out, epoch):
         z = out['features']
@@ -475,12 +545,22 @@ class PRC_Processor(Processor):
         num_leaves = leaf_probs.size(1)
 
         dist = 2.0 - 2.0 * torch.matmul(z, prototypes.t())
-        compact_loss = (leaf_probs * dist).sum(dim=1).mean()
+        proto_scores = torch.matmul(z.detach(), prototypes.detach().t())
+        target_probs = self._sinkhorn_targets(
+            proto_scores,
+            epsilon=self.arg.prc_soft_sinkhorn_epsilon,
+            niter=self.arg.prc_soft_sinkhorn_iters)
+
+        assignment_loss = -(
+            target_probs * torch.log(leaf_probs.clamp_min(1e-12))
+        ).sum(dim=1).mean()
+        compact_loss = (target_probs * dist).sum(dim=1).mean()
 
         leaf_marginal = leaf_probs.mean(dim=0)
-        leaf_mass = leaf_probs.detach().sum(dim=0).clamp_min(1e-12)
-        leaf_compactness = (leaf_probs.detach() * dist.detach()).sum(dim=0) / leaf_mass
-        leaf_scores = leaf_marginal.detach() * leaf_compactness
+        target_marginal = target_probs.mean(dim=0)
+        leaf_mass = target_probs.detach().sum(dim=0).clamp_min(1e-12)
+        leaf_compactness = (target_probs.detach() * dist.detach()).sum(dim=0) / leaf_mass
+        leaf_scores = target_marginal.detach() * leaf_compactness
         uniform_leaf = leaf_marginal.new_full((num_leaves,), 1.0 / float(num_leaves))
         balance_loss = (leaf_marginal * torch.log((leaf_marginal / uniform_leaf).clamp_min(1e-12))).sum()
 
@@ -508,21 +588,33 @@ class PRC_Processor(Processor):
             confidence_loss = compact_loss.new_tensor(0.0)
 
         loss = (
+            self.arg.prc_soft_assignment_weight * assignment_loss +
             self.arg.prc_soft_compactness_weight * compact_loss +
             self.arg.prc_soft_balance_weight * balance_loss +
             self.arg.prc_soft_node_balance_weight * node_balance_loss +
             self.arg.prc_soft_separation_weight * separation_loss +
             self.arg.prc_soft_confidence_weight * confidence_loss
         )
+        target_entropy = -(
+            target_probs * torch.log(target_probs.clamp_min(1e-12))
+        ).sum(dim=1) / np.log(float(num_leaves))
         stats = {
+            'assignment': assignment_loss,
             'compact': compact_loss,
             'balance': balance_loss,
             'node_balance': node_balance_loss,
             'separation': separation_loss,
             'confidence': confidence_loss,
             'mean_leaf_entropy': leaf_entropy.mean(),
+            'mean_target_entropy': target_entropy.mean(),
+            'pred_min_mass': leaf_marginal.min(),
+            'pred_max_mass': leaf_marginal.max(),
+            'target_min_mass': target_marginal.min(),
+            'target_max_mass': target_marginal.max(),
             'used_leaves': (leaf_marginal > (1.0 / float(num_leaves * 10))).float().sum(),
+            'target_used_leaves': (target_marginal > (1.0 / float(num_leaves * 10))).float().sum(),
             'leaf_scores': leaf_scores,
+            'leaf_masses': target_marginal.detach(),
             'leaf_ids': out['leaf_ids'],
         }
         return loss, stats
@@ -537,6 +629,7 @@ class PRC_Processor(Processor):
         loader = self.data_loader['train']
         loss_value = []
         soft_leaf_score_sum = None
+        soft_leaf_mass_sum = None
         soft_leaf_score_count = 0
         soft_leaf_score_ids = None
 
@@ -548,18 +641,21 @@ class PRC_Processor(Processor):
             if self.arg.prc_mode == 'soft':
                 out = self._model_core().forward_soft(data, temperature=self.arg.prc_soft_temperature)
                 loss, stats = self._soft_tree_loss(out, epoch)
-                ce_loss = stats['compact']
+                ce_loss = stats['assignment']
                 entropy_loss = stats['mean_leaf_entropy']
                 consistency_loss = ce_loss.new_tensor(0.0)
                 leaf_variance_loss = ce_loss.new_tensor(0.0)
                 prc_nodes = len(self._model_core().soft_internal_ids)
                 batch_size = data.size(0)
                 leaf_scores = stats['leaf_scores'].detach().cpu().numpy()
+                leaf_masses = stats['leaf_masses'].detach().cpu().numpy()
                 if soft_leaf_score_sum is None:
                     soft_leaf_score_sum = leaf_scores * batch_size
+                    soft_leaf_mass_sum = leaf_masses * batch_size
                     soft_leaf_score_ids = list(stats['leaf_ids'])
                 else:
                     soft_leaf_score_sum += leaf_scores * batch_size
+                    soft_leaf_mass_sum += leaf_masses * batch_size
                 soft_leaf_score_count += batch_size
             else:
                 if index is None:
@@ -612,9 +708,20 @@ class PRC_Processor(Processor):
             self.iter_info['prc_nodes'] = prc_nodes
             if self.arg.prc_mode == 'soft':
                 self.iter_info['bal'] = stats['balance'].data.item()
+                self.iter_info['node_bal'] = stats['node_balance'].data.item()
                 self.iter_info['sep'] = stats['separation'].data.item()
+                self.iter_info['assign'] = stats['assignment'].data.item()
+                self.iter_info['compact'] = stats['compact'].data.item()
+                self.iter_info['conf'] = stats['confidence'].data.item()
+                self.iter_info['leaf_ent'] = stats['mean_leaf_entropy'].data.item()
+                self.iter_info['tgt_ent'] = stats['mean_target_entropy'].data.item()
                 self.iter_info['used_leaves'] = int(stats['used_leaves'].data.item())
+                self.iter_info['tgt_leaves'] = int(stats['target_used_leaves'].data.item())
                 self.iter_info['prc_leaves'] = len(self._model_core().soft_leaf_ids)
+                self.iter_info['pred_mass'] = '{:.3f}-{:.3f}'.format(
+                    stats['pred_min_mass'].data.item(), stats['pred_max_mass'].data.item())
+                self.iter_info['tgt_mass'] = '{:.3f}-{:.3f}'.format(
+                    stats['target_min_mass'].data.item(), stats['target_max_mass'].data.item())
             else:
                 path_stats = self._last_path_weight_stats
                 self.iter_info['sup'] = '{:.3f}'.format(path_stats['trusted_ratio'])
@@ -627,6 +734,7 @@ class PRC_Processor(Processor):
         self.epoch_info['train_mean_loss'] = np.mean(loss_value) if loss_value else 0
         if self.arg.prc_mode == 'soft' and soft_leaf_score_sum is not None:
             self.soft_leaf_scores = soft_leaf_score_sum / max(soft_leaf_score_count, 1)
+            self.soft_leaf_masses = soft_leaf_mass_sum / max(soft_leaf_score_count, 1)
             self.soft_leaf_score_ids = soft_leaf_score_ids
         self.train_writer.add_scalar('loss', self.epoch_info['train_mean_loss'], epoch)
         self.show_epoch_info()
@@ -703,8 +811,20 @@ class PRC_Processor(Processor):
                             help='number of high-cost leaves to split at each growth step')
         parser.add_argument('--prc_soft_max_leaves', type=int, default=0,
                             help='optional safety cap for soft leaves; <=0 means uncapped')
+        parser.add_argument('--prc_soft_grow_penalty_weight', type=float, default=0.02,
+                            help='complexity penalty weight for soft PRC leaf splitting')
+        parser.add_argument('--prc_soft_grow_small_leaf_penalty_weight', type=float, default=0.0,
+                            help='extra soft PRC split penalty inversely proportional to leaf mass')
+        parser.add_argument('--prc_soft_grow_min_mass', type=float, default=0.02,
+                            help='minimum average target leaf mass required before a soft leaf can split')
         parser.add_argument('--prc_soft_split_noise', type=float, default=0.01,
                             help='prototype perturbation when a soft leaf is split')
+        parser.add_argument('--prc_soft_assignment_weight', type=float, default=1.0,
+                            help='weight for Sinkhorn balanced assignment supervision')
+        parser.add_argument('--prc_soft_sinkhorn_iters', type=int, default=3,
+                            help='number of Sinkhorn normalization iterations for soft PRC targets')
+        parser.add_argument('--prc_soft_sinkhorn_epsilon', type=float, default=0.05,
+                            help='temperature for Sinkhorn target scores; smaller gives sharper balanced targets')
         parser.add_argument('--prc_soft_compactness_weight', type=float, default=1.0,
                             help='weight for soft assignment prototype compactness')
         parser.add_argument('--prc_soft_balance_weight', type=float, default=0.1,

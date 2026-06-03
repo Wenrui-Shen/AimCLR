@@ -41,7 +41,7 @@ start_epoch: 0
 stream: 'joint'
 
 # progressive recursive clustering
-prc_mode: 'hard'
+prc_mode: 'soft'
 prc_reassign: 5
 prc_force_root_split: True
 prc_kmeans_iters: 30
@@ -69,6 +69,25 @@ prc_leaf_variance_eps: 0.01
 prc_entropy_min_samples: 8
 prc_seed: 0
 prc_save_tree: True
+prc_soft_temperature: 0.2
+prc_soft_grow_start_epoch: 20
+prc_soft_grow_interval: 10
+prc_soft_grow_leaves: 1
+prc_soft_max_leaves: 32
+prc_soft_grow_penalty_weight: 0.02
+prc_soft_grow_small_leaf_penalty_weight: 0.0
+prc_soft_grow_min_mass: 0.02
+prc_soft_split_noise: 0.01
+prc_soft_assignment_weight: 1.0
+prc_soft_compactness_weight: 1.0
+prc_soft_balance_weight: 0.0
+prc_soft_node_balance_weight: 0.05
+prc_soft_separation_weight: 0.1
+prc_soft_separation_margin: 0.5
+prc_soft_confidence_weight: 0.02
+prc_soft_confidence_start_epoch: 30
+prc_soft_sinkhorn_iters: 3
+prc_soft_sinkhorn_epsilon: 0.05
 
 # log
 save_interval: 5
