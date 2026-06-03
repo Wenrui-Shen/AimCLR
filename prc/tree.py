@@ -148,21 +148,18 @@ class ProgressiveRecursiveTree(object):
     """Dynamic binary clustering tree for PRC pseudo labels."""
 
     def __init__(self, num_samples, force_root_split=True, kmeans_iters=30, seed=0,
-                 routing_temperature=0.2, reassign_confidence=0.0,
-                 depth_penalty_weight=100.0, parent_size_penalty_weight=1.0,
-                 tiny_child_penalty_weight=1.0, parent_cluster_ratio=0.005,
-                 tiny_child_ratio=0.005, true_labels=None):
+                 routing_temperature=0.2, depth_penalty_weight=100.0, parent_size_penalty_weight=1.0,
+                 tiny_child_penalty_weight=1.0, grow_confidence_threshold=0.9,
+                 true_labels=None):
         self.num_samples = int(num_samples)
         self.force_root_split = bool(force_root_split)
         self.kmeans_iters = int(kmeans_iters)
         self.seed = int(seed)
         self.routing_temperature = float(routing_temperature)
-        self.reassign_confidence = float(reassign_confidence)
         self.depth_penalty_weight = float(depth_penalty_weight)
         self.parent_size_penalty_weight = float(parent_size_penalty_weight)
         self.tiny_child_penalty_weight = float(tiny_child_penalty_weight)
-        self.parent_cluster_ratio = float(parent_cluster_ratio)
-        self.tiny_child_ratio = float(tiny_child_ratio)
+        self.grow_confidence_threshold = float(grow_confidence_threshold)
         self.true_labels = None if true_labels is None else np.asarray(true_labels)
         self.control_stats = {}
 
@@ -183,6 +180,21 @@ class ProgressiveRecursiveTree(object):
         features = _l2_normalize(np.asarray(features, dtype=np.float32))
         reassign_stats = self.soft_reassign(features)
         split_nodes = []
+        root_bootstrap_pending = len(self.internal_node_ids()) == 0 and self.force_root_split
+        growth_blocked = (
+            not root_bootstrap_pending and
+            self.grow_confidence_threshold > 0 and
+            reassign_stats['mean_confidence'] < self.grow_confidence_threshold
+        )
+        if growth_blocked:
+            self.control_stats = {
+                'num_candidates': 0,
+                'growth_blocked': True,
+                'block_reason': 'route_conf {:.4f} < {:.4f}'.format(
+                    reassign_stats['mean_confidence'], self.grow_confidence_threshold),
+            }
+            return split_nodes, reassign_stats
+
         candidates = sorted(self.leaves(), key=lambda n: (-n.depth, -len(n.samples), n.node_id))
         split_candidates = []
 
@@ -207,13 +219,8 @@ class ProgressiveRecursiveTree(object):
         return split_nodes, reassign_stats
 
     def soft_reassign(self, features):
-        """Softly route samples among existing siblings, then commit hard paths."""
+        """Top-down local binary K-means reassignment on the existing tree."""
         old_paths = self.sample_paths
-        previous_child = {}
-        for sample_idx, path in enumerate(old_paths):
-            for parent_id, child_pos in path:
-                previous_child[(sample_idx, parent_id)] = child_pos
-
         root = self.nodes[0]
         root.samples = np.arange(self.num_samples, dtype=np.int64)
         stats = {
@@ -229,6 +236,14 @@ class ProgressiveRecursiveTree(object):
                 child.samples = np.asarray([], dtype=np.int64)
                 clear_descendants(child)
 
+        def prune_descendants(node):
+            for child_id in list(node.children):
+                child = self.nodes[child_id]
+                prune_descendants(child)
+                if child_id in self.nodes:
+                    del self.nodes[child_id]
+            node.children = []
+
         def route(node):
             if node.is_leaf:
                 return
@@ -237,32 +252,27 @@ class ProgressiveRecursiveTree(object):
                 clear_descendants(node)
                 return
             children = [self.nodes[child_id] for child_id in node.children]
-            centers = []
-            for child in children:
-                if len(child.samples) == 0:
-                    centers.append(features[samples].mean(axis=0))
-                else:
-                    centers.append(features[child.samples].mean(axis=0))
-            centers = _l2_normalize(np.stack(centers, axis=0).astype(np.float32))
-            sims = np.dot(features[samples], centers.T)
-            probs = _softmax(sims, temperature=self.routing_temperature)
-            hard_pos = probs.argmax(axis=1).astype(np.int64)
-            max_prob = probs[np.arange(len(samples)), hard_pos]
+            x = features[samples]
+            labels, _, centers = _binary_kmeans(
+                x, seed=self.seed + self.stage * 3571 + node.node_id, niter=self.kmeans_iters)
 
-            if self.reassign_confidence > 0:
-                for row, sample_idx in enumerate(samples):
-                    old_pos = previous_child.get((int(sample_idx), node.node_id))
-                    if old_pos is not None and max_prob[row] < self.reassign_confidence:
-                        hard_pos[row] = int(old_pos)
+            if labels is None or np.bincount(labels, minlength=len(children)).min() == 0:
+                prune_descendants(node)
+                return
+
+            centers = _l2_normalize(centers.astype(np.float32))
+            sims = np.dot(x, centers.T)
+            probs = _softmax(sims, temperature=self.routing_temperature)
+            route_conf = probs[np.arange(len(samples)), labels]
+
+            for child_pos, child in enumerate(children):
+                child.samples = samples[labels == child_pos]
 
             node.reassign_stats = {
                 'n': int(len(samples)),
-                'mean_confidence': float(max_prob.mean()) if len(max_prob) else 0.0,
+                'mean_confidence': float(route_conf.mean()) if len(route_conf) else 0.0,
             }
-            confidences.extend(max_prob.tolist())
-
-            for child_pos, child in enumerate(children):
-                child.samples = samples[hard_pos == child_pos]
+            confidences.extend(route_conf.tolist())
             for child in children:
                 route(child)
 
@@ -331,25 +341,17 @@ class ProgressiveRecursiveTree(object):
             float(node.depth + 1) ** 2
         )
 
-        parent_ratio = float(n) / max(float(self.num_samples), 1.0)
-        parent_target = max(self.parent_cluster_ratio, 1e-12)
-        parent_gap = max(0.0, (parent_target - parent_ratio) / parent_target)
         parent_size_penalty = (
             self.parent_size_penalty_weight *
-            float(self.num_samples) *
             float(dim) *
-            parent_gap ** 2
+            float(self.num_samples) / max(float(n), 1.0)
         )
 
         min_child = float(np.min(counts))
-        child_ratio = min_child / max(float(self.num_samples), 1.0)
-        child_target = max(self.tiny_child_ratio, 1e-12)
-        child_gap = max(0.0, (child_target - child_ratio) / child_target)
         tiny_child_penalty = (
             self.tiny_child_penalty_weight *
-            float(self.num_samples) *
             float(dim) *
-            child_gap ** 2
+            float(self.num_samples) / max(min_child, 1.0)
         )
         return depth_penalty, parent_size_penalty, tiny_child_penalty
 

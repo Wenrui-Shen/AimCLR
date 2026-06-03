@@ -40,12 +40,10 @@ class PRC_Processor(Processor):
             kmeans_iters=self.arg.prc_kmeans_iters,
             seed=self.arg.prc_seed,
             routing_temperature=self.arg.prc_routing_temperature,
-            reassign_confidence=self.arg.prc_reassign_confidence,
             depth_penalty_weight=self.arg.prc_depth_penalty_weight,
             parent_size_penalty_weight=self.arg.prc_parent_size_penalty_weight,
             tiny_child_penalty_weight=self.arg.prc_tiny_child_penalty_weight,
-            parent_cluster_ratio=self.arg.prc_parent_cluster_ratio,
-            tiny_child_ratio=self.arg.prc_tiny_child_ratio,
+            grow_confidence_threshold=self.arg.prc_grow_confidence_threshold,
             true_labels=getattr(self.data_loader['train'].dataset, 'label', None))
 
     def load_optimizer(self):
@@ -159,6 +157,9 @@ class PRC_Processor(Processor):
         if control:
             self.io.print_log(
                 '  candidates | {}'.format(control['num_candidates']))
+            if control.get('growth_blocked'):
+                self.io.print_log(
+                    '  grow blocked | {}'.format(control['block_reason']))
         for parent_id, stats in split_nodes:
             self.io.print_log(
                 '  split node {} | n {} | counts {} | gain {:.4f} | score {:.2f} | delta_bic {:.2f} | depth_pen {:.2f} | parent_pen {:.2f} | child_pen {:.2f} | parent_ratio {:.4f} | child_ratio {:.4f} | parent_bic {:.2f} | child_bic {:.2f}'.format(
@@ -210,7 +211,7 @@ class PRC_Processor(Processor):
             entropy_loss = sum(entropy_penalties) / max(sum(weights), 1e-12)
         else:
             entropy_loss = ce_loss.new_tensor(0.0)
-        loss = ce_loss + self.arg.prc_entropy_weight * entropy_loss
+        loss = self.arg.prc_ce_weight * ce_loss + self.arg.prc_entropy_weight * entropy_loss
         return loss, ce_loss, entropy_loss
 
     def _leaf_probabilities(self, logits, reference):
@@ -385,6 +386,7 @@ class PRC_Processor(Processor):
                 loss, stats = self._soft_tree_loss(out, epoch)
                 ce_loss = stats['compact']
                 entropy_loss = stats['mean_leaf_entropy']
+                leaf_variance_loss = ce_loss.new_tensor(0.0)
                 prc_nodes = len(self._model_core().soft_internal_ids)
                 batch_size = data.size(0)
                 leaf_scores = stats['leaf_scores'].detach().cpu().numpy()
@@ -405,7 +407,6 @@ class PRC_Processor(Processor):
                     continue
                 leaf_variance_loss = self._leaf_variance_loss(logits, features, loss)
                 loss = loss + self.arg.prc_leaf_variance_weight * leaf_variance_loss
-                entropy_loss = entropy_loss + leaf_variance_loss
                 prc_nodes = len(node_ids)
 
             self.optimizer.zero_grad()
@@ -415,6 +416,7 @@ class PRC_Processor(Processor):
             self.iter_info['loss'] = loss.data.item()
             self.iter_info['ce'] = ce_loss.data.item()
             self.iter_info['ent'] = entropy_loss.data.item()
+            self.iter_info['var'] = leaf_variance_loss.data.item()
             self.iter_info['lr'] = '{:.6f}'.format(self.lr)
             self.iter_info['prc_nodes'] = prc_nodes
             if self.arg.prc_mode == 'soft':
@@ -455,18 +457,16 @@ class PRC_Processor(Processor):
         parser.add_argument('--prc_force_root_split', type=str2bool, default=True, help='bootstrap with root split')
         parser.add_argument('--prc_kmeans_iters', type=int, default=30, help='local k-means iterations')
         parser.add_argument('--prc_routing_temperature', type=float, default=0.2, help='soft tree routing temperature')
-        parser.add_argument('--prc_reassign_confidence', type=float, default=0.0,
-                            help='keep old sibling when soft route confidence is below this value')
+        parser.add_argument('--prc_grow_confidence_threshold', type=float, default=0.9,
+                            help='skip hard PRC growth when mean route confidence is below this value')
+        parser.add_argument('--prc_ce_weight', type=float, default=1.0,
+                            help='weight for hard PRC path cross entropy')
         parser.add_argument('--prc_depth_penalty_weight', type=float, default=100.0,
                             help='weight for depth-dependent hard PRC split penalty')
         parser.add_argument('--prc_parent_size_penalty_weight', type=float, default=1.0,
                             help='weight for parent-size hard PRC split penalty')
         parser.add_argument('--prc_tiny_child_penalty_weight', type=float, default=1.0,
                             help='weight for tiny-child hard PRC split penalty')
-        parser.add_argument('--prc_parent_cluster_ratio', type=float, default=0.005,
-                            help='target minimum global ratio for a parent node to split')
-        parser.add_argument('--prc_tiny_child_ratio', type=float, default=0.005,
-                            help='target minimum global ratio for the smaller child in hard PRC splits')
         parser.add_argument('--prc_entropy_weight', type=float, default=0.05, help='weight for marginal entropy floor')
         parser.add_argument('--prc_entropy_floor', type=float, default=0.35, help='normalized marginal entropy floor')
         parser.add_argument('--prc_leaf_variance_weight', type=float, default=0.05,
