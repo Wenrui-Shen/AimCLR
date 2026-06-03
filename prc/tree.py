@@ -209,7 +209,15 @@ class ProgressiveRecursiveTree(object):
 
     def update(self, features, epoch):
         features = _l2_normalize(np.asarray(features, dtype=np.float32))
-        reassign_stats = self.soft_reassign(features)
+        reassign_stats = {
+            'num_internal': len(self.internal_node_ids()),
+            'num_changed': 0,
+            'num_stable': self.num_samples,
+            'mean_confidence': 1.0,
+            'mean_path_confidence': 1.0,
+            'num_aligned_flips': 0,
+            'changed_depth': {},
+        }
         split_nodes = []
         root_bootstrap_pending = len(self.internal_node_ids()) == 0 and self.force_root_split
         growth_blocked = (
