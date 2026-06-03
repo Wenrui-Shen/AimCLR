@@ -42,11 +42,11 @@ stream: 'joint'
 
 # progressive recursive clustering
 prc_mode: 'hard'
-prc_reassign: 3
+prc_reassign: 5
 prc_force_root_split: True
 prc_kmeans_iters: 30
 prc_routing_temperature: 0.2
-prc_grow_confidence_threshold: 0.88
+prc_grow_confidence_threshold: 0.90
 prc_target_view: 1
 prc_consistency_view: 2
 prc_consistency_weight: 3.0
@@ -54,6 +54,8 @@ prc_use_momentum: True
 prc_momentum: 0.99
 prc_teacher_temperature: 1.0
 prc_tree_no_aug: True
+prc_path_conf_threshold: 0.95
+prc_unstable_sample_weight: 0.2
 prc_balanced_assignment_base_ratio: 0.2
 prc_balanced_assignment_floor_ratio: 0.02
 prc_ce_weight: 3.0

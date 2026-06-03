@@ -189,6 +189,8 @@ class ProgressiveRecursiveTree(object):
         }
         self.next_node_id = 1
         self.sample_paths = [[] for _ in range(self.num_samples)]
+        self.sample_path_confidence = np.ones(self.num_samples, dtype=np.float32)
+        self.sample_path_stable = np.ones(self.num_samples, dtype=np.bool_)
         self.stage = 0
 
     def leaves(self):
@@ -255,10 +257,14 @@ class ProgressiveRecursiveTree(object):
         stats = {
             'num_internal': len(self.internal_node_ids()),
             'num_changed': 0,
+            'num_stable': self.num_samples,
             'mean_confidence': 0.0,
+            'mean_path_confidence': 1.0,
             'num_aligned_flips': 0,
+            'changed_depth': {},
         }
         confidences = []
+        path_confidence = np.ones(self.num_samples, dtype=np.float32)
 
         def clear_descendants(node):
             for child_id in node.children:
@@ -288,6 +294,7 @@ class ProgressiveRecursiveTree(object):
                 niter=self.kmeans_iters, min_child_count=self._min_child_count(node, len(samples)))
 
             if labels is None or np.bincount(labels, minlength=len(children)).min() == 0:
+                path_confidence[samples] = 0.0
                 prune_descendants(node)
                 return
 
@@ -310,6 +317,7 @@ class ProgressiveRecursiveTree(object):
             sims = np.dot(x, centers.T)
             probs = _softmax(sims, temperature=self.routing_temperature)
             route_conf = probs[np.arange(len(samples)), labels]
+            path_confidence[samples] = np.minimum(path_confidence[samples], route_conf)
 
             for child_pos, child in enumerate(children):
                 child.samples = samples[labels == child_pos]
@@ -325,12 +333,59 @@ class ProgressiveRecursiveTree(object):
         route(root)
         self._rebuild_sample_paths()
 
+        sample_path_stable = np.ones(self.num_samples, dtype=np.bool_)
+        changed_depth = {}
         for sample_idx, path in enumerate(self.sample_paths):
             if path != old_paths[sample_idx]:
                 stats['num_changed'] += 1
+                sample_path_stable[sample_idx] = False
+                old_path = old_paths[sample_idx]
+                max_depth = max(len(old_path), len(path))
+                for depth in range(max_depth):
+                    old_step = old_path[depth] if depth < len(old_path) else None
+                    new_step = path[depth] if depth < len(path) else None
+                    if old_step != new_step:
+                        changed_depth[depth] = changed_depth.get(depth, 0) + 1
+                        break
+        self.sample_path_confidence = path_confidence
+        self.sample_path_stable = sample_path_stable
+        stats['num_stable'] = int(sample_path_stable.sum())
+        stats['mean_path_confidence'] = float(path_confidence.mean())
+        stats['changed_depth'] = {
+            int(depth): int(count)
+            for depth, count in sorted(changed_depth.items())
+        }
         if confidences:
             stats['mean_confidence'] = float(np.mean(confidences))
         return stats
+
+    def supervision_weights_for_indices(self, indices, confidence_threshold=0.0,
+                                        unstable_weight=1.0):
+        indices = np.asarray([int(i) for i in indices], dtype=np.int64)
+        if len(indices) == 0:
+            return np.asarray([], dtype=np.float32), {
+                'stable_ratio': 0.0,
+                'high_conf_ratio': 0.0,
+                'trusted_ratio': 0.0,
+                'mean_weight': 0.0,
+            }
+
+        stable = self.sample_path_stable[indices]
+        confidence = self.sample_path_confidence[indices]
+        threshold = float(confidence_threshold)
+        high_conf = confidence >= threshold if threshold > 0 else np.ones(len(indices), dtype=np.bool_)
+        trusted = np.logical_or(stable, high_conf)
+
+        weights = np.ones(len(indices), dtype=np.float32)
+        weights[~trusted] = float(unstable_weight)
+        weights = np.maximum(weights, 0.0)
+        stats = {
+            'stable_ratio': float(stable.mean()),
+            'high_conf_ratio': float(high_conf.mean()),
+            'trusted_ratio': float(trusted.mean()),
+            'mean_weight': float(weights.mean()),
+        }
+        return weights, stats
 
     def _evaluate_split_candidate(self, node, features):
         samples = node.samples

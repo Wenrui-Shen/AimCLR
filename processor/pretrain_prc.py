@@ -80,6 +80,12 @@ class PRC_Processor(Processor):
             balanced_assignment_base_ratio=self.arg.prc_balanced_assignment_base_ratio,
             balanced_assignment_floor_ratio=self.arg.prc_balanced_assignment_floor_ratio,
             true_labels=getattr(self.data_loader['train'].dataset, 'label', None))
+        self._last_path_weight_stats = {
+            'stable_ratio': 1.0,
+            'high_conf_ratio': 1.0,
+            'trusted_ratio': 1.0,
+            'mean_weight': 1.0,
+        }
 
     def load_optimizer(self):
         if self.arg.optimizer == 'SGD':
@@ -245,12 +251,20 @@ class PRC_Processor(Processor):
         self._sync_heads_with_tree(split_nodes)
         summary = self.prc_tree.summary()
         self.io.print_log(
-            'PRC stage {} | splits {} | reassign_changed {} | route_conf {:.4f} | align_flip {} | nodes {} | leaves {} | max_depth {} | leaf_size {}-{}'.format(
+            'PRC stage {} | splits {} | reassign_changed {} | stable {} | route_conf {:.4f} | path_conf {:.4f} | align_flip {} | nodes {} | leaves {} | max_depth {} | leaf_size {}-{}'.format(
                 self.prc_tree.stage, len(split_nodes),
-                reassign_stats['num_changed'], reassign_stats['mean_confidence'],
+                reassign_stats['num_changed'], reassign_stats.get('num_stable', 0),
+                reassign_stats['mean_confidence'],
+                reassign_stats.get('mean_path_confidence', 0.0),
                 reassign_stats.get('num_aligned_flips', 0),
                 summary['num_nodes'], summary['num_leaves'],
                 summary['max_depth'], summary['min_leaf_size'], summary['max_leaf_size']))
+        changed_depth = reassign_stats.get('changed_depth', {})
+        if changed_depth:
+            self.io.print_log(
+                '  changed_depth | {}'.format(
+                    ' | '.join('d{} {}'.format(depth, count)
+                              for depth, count in sorted(changed_depth.items()))))
         control = self.prc_tree.control_stats
         if control:
             self.io.print_log(
@@ -287,12 +301,21 @@ class PRC_Processor(Processor):
         if self.arg.prc_save_tree:
             self.prc_tree.save(os.path.join(self.arg.work_dir, 'prc_tree_epoch{}.pkl'.format(epoch)))
 
-    def _path_loss(self, logits, index, ce_weight=None, entropy_weight=None):
+    def _path_loss(self, logits, index, ce_weight=None, entropy_weight=None,
+                   collect_weight_stats=False):
         if index is None:
             raise ValueError('Hard PRC requires train_feeder_args.return_index: True')
         ce_weight = self.arg.prc_ce_weight if ce_weight is None else float(ce_weight)
         entropy_weight = self.arg.prc_entropy_weight if entropy_weight is None else float(entropy_weight)
-        targets = self.prc_tree.targets_for_indices(index.detach().cpu().numpy())
+        index_np = index.detach().cpu().numpy()
+        targets = self.prc_tree.targets_for_indices(index_np)
+        sample_weights_np, weight_stats = self.prc_tree.supervision_weights_for_indices(
+            index_np,
+            confidence_threshold=self.arg.prc_path_conf_threshold,
+            unstable_weight=self.arg.prc_unstable_sample_weight)
+        sample_weights = torch.from_numpy(sample_weights_np).float().to(self.dev)
+        if collect_weight_stats:
+            self._last_path_weight_stats = weight_stats
         losses = []
         weights = []
         entropy_penalties = []
@@ -303,14 +326,21 @@ class PRC_Processor(Processor):
             mask = target >= 0
             if mask.sum().item() == 0:
                 continue
-            loss = F.cross_entropy(logits[parent_id][mask], target[mask])
+            node_weights = sample_weights[mask]
+            weight_sum = node_weights.sum()
+            if weight_sum.item() <= 0:
+                continue
+            ce_per_sample = F.cross_entropy(
+                logits[parent_id][mask], target[mask], reduction='none')
+            loss = (ce_per_sample * node_weights).sum() / weight_sum.clamp_min(1e-12)
             weight = 1.0
             losses.append(loss * weight)
             weights.append(weight)
 
             if entropy_weight > 0 and mask.sum().item() >= self.arg.prc_entropy_min_samples:
                 probs = torch.softmax(logits[parent_id][mask], dim=1)
-                marginal = probs.mean(dim=0)
+                marginal = (probs * node_weights.unsqueeze(1)).sum(dim=0)
+                marginal = marginal / weight_sum.clamp_min(1e-12)
                 entropy = -(marginal * torch.log(marginal.clamp_min(1e-12))).sum()
                 entropy = entropy / np.log(float(probs.size(1)))
                 entropy_penalties.append(F.relu(self.arg.prc_entropy_floor - entropy) * weight)
@@ -537,7 +567,8 @@ class PRC_Processor(Processor):
                 index = index.long()
                 node_ids = self.prc_tree.internal_node_ids()
                 logits, features = self._model_core()(data, node_ids=node_ids)
-                loss, ce_loss, entropy_loss = self._path_loss(logits, index)
+                loss, ce_loss, entropy_loss = self._path_loss(
+                    logits, index, collect_weight_stats=True)
                 if loss is None:
                     continue
                 consistency_loss = loss.new_tensor(0.0)
@@ -584,6 +615,10 @@ class PRC_Processor(Processor):
                 self.iter_info['sep'] = stats['separation'].data.item()
                 self.iter_info['used_leaves'] = int(stats['used_leaves'].data.item())
                 self.iter_info['prc_leaves'] = len(self._model_core().soft_leaf_ids)
+            else:
+                path_stats = self._last_path_weight_stats
+                self.iter_info['sup'] = '{:.3f}'.format(path_stats['trusted_ratio'])
+                self.iter_info['sup_w'] = '{:.3f}'.format(path_stats['mean_weight'])
             loss_value.append(self.iter_info['loss'])
             self.show_iter_info()
             self.meta_info['iter'] += 1
@@ -633,6 +668,10 @@ class PRC_Processor(Processor):
                             help='temperature for hard PRC teacher-student route consistency')
         parser.add_argument('--prc_tree_no_aug', type=str2bool, default=True,
                             help='extract hard PRC tree-update features from the raw no-augmentation training stream')
+        parser.add_argument('--prc_path_conf_threshold', type=float, default=0.0,
+                            help='confidence threshold for full-weight hard PRC path supervision; <=0 disables filtering')
+        parser.add_argument('--prc_unstable_sample_weight', type=float, default=1.0,
+                            help='CE weight for hard PRC samples whose path changed and confidence is below threshold')
         parser.add_argument('--prc_ce_weight', type=float, default=1.0,
                             help='weight for hard PRC path cross entropy')
         parser.add_argument('--prc_depth_penalty_weight', type=float, default=100.0,
