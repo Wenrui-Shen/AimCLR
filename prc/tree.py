@@ -517,6 +517,7 @@ class ProgressiveRecursiveTree(object):
             'bic_children': bic_children,
             'delta_bic': delta_bic,
             'counts': counts.astype(np.int64).tolist(),
+            'centers': _l2_normalize(centers.astype(np.float32)),
         }
         return node.split_stats
 

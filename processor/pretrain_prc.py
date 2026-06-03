@@ -1,8 +1,10 @@
 import argparse
+import copy
 import os
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data
@@ -15,6 +17,19 @@ from .processor import Processor, init_seed
 from prc import ProgressiveRecursiveTree
 
 
+class _NoAugIndexDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset):
+        self.data = dataset.data
+        self.label = dataset.label
+        self.sample_name = getattr(dataset, 'sample_name', None)
+
+    def __len__(self):
+        return len(self.label)
+
+    def __getitem__(self, index):
+        return np.array(self.data[index]), self.label[index], index
+
+
 class PRC_Processor(Processor):
     """
         Processor for Progressive Recursive Clustering pre-training.
@@ -25,6 +40,24 @@ class PRC_Processor(Processor):
         if self.arg.prc_mode == 'soft':
             self.model.init_soft_tree()
         self.model.apply(weights_init)
+        self.momentum_model = None
+        if self.arg.prc_mode == 'hard' and self.arg.prc_use_momentum:
+            self.momentum_model = copy.deepcopy(self.model)
+            self._set_momentum_requires_grad(False)
+
+    def load_weights(self):
+        super(PRC_Processor, self).load_weights()
+        if self.momentum_model is not None:
+            self.momentum_model.load_state_dict(self.model.state_dict())
+            self._set_momentum_requires_grad(False)
+
+    def gpu(self):
+        super(PRC_Processor, self).gpu()
+        if self.momentum_model is not None:
+            self.momentum_model = self.momentum_model.to(self.dev)
+            if self.arg.use_gpu and len(self.gpus) > 1:
+                self.momentum_model = nn.DataParallel(self.momentum_model, device_ids=self.gpus)
+            self.momentum_model.eval()
 
     def load_data(self):
         super(PRC_Processor, self).load_data()
@@ -77,6 +110,32 @@ class PRC_Processor(Processor):
     def _model_core(self):
         return self.model.module if hasattr(self.model, 'module') else self.model
 
+    def _momentum_core(self):
+        if self.momentum_model is None:
+            return None
+        return self.momentum_model.module if hasattr(self.momentum_model, 'module') else self.momentum_model
+
+    def _set_momentum_requires_grad(self, requires_grad):
+        if self.momentum_model is None:
+            return
+        for param in self.momentum_model.parameters():
+            param.requires_grad = bool(requires_grad)
+
+    @torch.no_grad()
+    def _update_momentum_model(self):
+        if self.momentum_model is None:
+            return
+        momentum = float(self.arg.prc_momentum)
+        online_state = self._model_core().state_dict()
+        momentum_state = self._momentum_core().state_dict()
+        for key, value_m in momentum_state.items():
+            value_o = online_state[key].detach()
+            if value_m.dtype.is_floating_point:
+                value_m.mul_(momentum).add_(value_o, alpha=1.0 - momentum)
+            else:
+                value_m.copy_(value_o)
+        self.momentum_model.eval()
+
     def _prepare_stream(self, data):
         if self.arg.stream == 'joint':
             return data
@@ -120,8 +179,16 @@ class PRC_Processor(Processor):
         data = data.float().to(self.dev, non_blocking=True)
         return self._prepare_stream(data)
 
-    def _extract_features(self):
+    def _tree_feature_dataset(self):
         dataset = self.data_loader['train'].dataset
+        if self.arg.prc_tree_no_aug and hasattr(dataset, 'data') and hasattr(dataset, 'label'):
+            return _NoAugIndexDataset(dataset)
+        return dataset
+
+    def _extract_features(self):
+        dataset = self._tree_feature_dataset()
+        feature_model = self.momentum_model if self.momentum_model is not None else self.model
+        feature_core = self._momentum_core() if self.momentum_model is not None else self._model_core()
         loader = torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=self.arg.test_batch_size,
@@ -131,30 +198,44 @@ class PRC_Processor(Processor):
             drop_last=False,
             worker_init_fn=init_seed)
 
-        was_training = self.model.training
-        self.model.eval()
+        was_training = feature_model.training
+        feature_model.eval()
         features = np.zeros((len(dataset), self.arg.model_args['feature_dim']), dtype=np.float32)
         with torch.no_grad():
             for batch in loader:
                 data_pack, _, index = self._parse_batch(batch)
                 data = self._prepare_data_view(data_pack, self.arg.prc_target_view)
-                z = self._model_core().forward_features(data)
+                z = feature_core.forward_features(data)
                 features[index.numpy()] = z.detach().cpu().numpy()
 
         if was_training:
-            self.model.train()
+            feature_model.train()
         return features
 
     def _sync_heads_with_tree(self, split_nodes):
         core = self._model_core()
-        for parent_id, _ in split_nodes:
+        momentum_core = self._momentum_core()
+        for parent_id, stats in split_nodes:
             key = str(int(parent_id))
             if key in core.heads:
                 continue
-            head = core.add_split_head(parent_id)
-            head.apply(weights_init)
+            centers = stats.get('centers')
+            if centers is not None:
+                head = core.init_split_head(parent_id, centers)
+            else:
+                head = core.add_split_head(parent_id)
+                head.apply(weights_init)
             head.to(self.dev)
             self.optimizer.add_param_group({'params': head.parameters()})
+            if momentum_core is not None:
+                if centers is not None:
+                    momentum_head = momentum_core.init_split_head(parent_id, centers)
+                else:
+                    momentum_head = momentum_core.add_split_head(parent_id)
+                    momentum_head.apply(weights_init)
+                momentum_head.to(self.dev)
+                for param in momentum_head.parameters():
+                    param.requires_grad = False
 
     def _update_tree(self, epoch):
         if (epoch - 1) % self.arg.prc_reassign != 0:
@@ -244,6 +325,30 @@ class PRC_Processor(Processor):
             entropy_loss = ce_loss.new_tensor(0.0)
         loss = ce_weight * ce_loss + entropy_weight * entropy_loss
         return loss, ce_loss, entropy_loss
+
+    def _teacher_route_consistency_loss(self, student_logits, teacher_logits, index):
+        if self.arg.prc_consistency_weight <= 0:
+            return None
+        targets = self.prc_tree.targets_for_indices(index.detach().cpu().numpy())
+        temperature = max(float(self.arg.prc_teacher_temperature), 1e-6)
+        losses = []
+        weights = []
+        for parent_id, target_np in targets.items():
+            if parent_id not in student_logits or parent_id not in teacher_logits:
+                continue
+            target = torch.from_numpy(target_np).long().to(self.dev)
+            mask = target >= 0
+            if mask.sum().item() == 0:
+                continue
+            student = student_logits[parent_id][mask] / temperature
+            teacher = teacher_logits[parent_id][mask] / temperature
+            teacher_prob = torch.softmax(teacher.detach(), dim=1)
+            student_log_prob = torch.log_softmax(student, dim=1)
+            losses.append(F.kl_div(student_log_prob, teacher_prob, reduction='batchmean') * temperature * temperature)
+            weights.append(1.0)
+        if not losses:
+            return None
+        return sum(losses) / max(sum(weights), 1e-12)
 
     def _leaf_probabilities(self, logits, reference):
         leaves = self.prc_tree.leaves()
@@ -442,14 +547,22 @@ class PRC_Processor(Processor):
                     len(data_pack) > 1
                 ):
                     cons_data = self._prepare_data_view(data_pack, self.arg.prc_consistency_view)
-                    cons_logits, _ = self._model_core()(cons_data, node_ids=node_ids)
-                    cons_loss, cons_ce, _ = self._path_loss(
-                        cons_logits, index,
-                        ce_weight=self.arg.prc_consistency_weight,
-                        entropy_weight=0.0)
-                    if cons_loss is not None:
-                        loss = loss + cons_loss
-                        consistency_loss = cons_ce
+                    if self.momentum_model is not None:
+                        with torch.no_grad():
+                            cons_logits, _ = self._momentum_core()(cons_data, node_ids=node_ids)
+                        cons_loss = self._teacher_route_consistency_loss(logits, cons_logits, index)
+                        if cons_loss is not None:
+                            loss = loss + self.arg.prc_consistency_weight * cons_loss
+                            consistency_loss = cons_loss
+                    else:
+                        cons_logits, _ = self._model_core()(cons_data, node_ids=node_ids)
+                        cons_loss, cons_ce, _ = self._path_loss(
+                            cons_logits, index,
+                            ce_weight=self.arg.prc_consistency_weight,
+                            entropy_weight=0.0)
+                        if cons_loss is not None:
+                            loss = loss + cons_loss
+                            consistency_loss = cons_ce
                 leaf_variance_loss = self._leaf_variance_loss(logits, features, loss)
                 loss = loss + self.arg.prc_leaf_variance_weight * leaf_variance_loss
                 prc_nodes = len(node_ids)
@@ -457,6 +570,7 @@ class PRC_Processor(Processor):
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
+            self._update_momentum_model()
 
             self.iter_info['loss'] = loss.data.item()
             self.iter_info['ce'] = ce_loss.data.item()
@@ -510,7 +624,15 @@ class PRC_Processor(Processor):
         parser.add_argument('--prc_consistency_view', type=int, default=0,
                             help='view index used for hard PRC augmentation consistency')
         parser.add_argument('--prc_consistency_weight', type=float, default=0.0,
-                            help='weight for hard PRC path consistency on another augmented view')
+                            help='weight for hard PRC teacher route consistency on another augmented view')
+        parser.add_argument('--prc_use_momentum', type=str2bool, default=True,
+                            help='use a momentum teacher model for hard PRC tree updates and consistency')
+        parser.add_argument('--prc_momentum', type=float, default=0.99,
+                            help='EMA momentum for the hard PRC teacher model')
+        parser.add_argument('--prc_teacher_temperature', type=float, default=1.0,
+                            help='temperature for hard PRC teacher-student route consistency')
+        parser.add_argument('--prc_tree_no_aug', type=str2bool, default=True,
+                            help='extract hard PRC tree-update features from the raw no-augmentation training stream')
         parser.add_argument('--prc_ce_weight', type=float, default=1.0,
                             help='weight for hard PRC path cross entropy')
         parser.add_argument('--prc_depth_penalty_weight', type=float, default=100.0,

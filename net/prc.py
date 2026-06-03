@@ -37,6 +37,15 @@ class PRC(nn.Module):
             self.heads[key] = nn.Linear(self.feature_dim, 2)
         return self.heads[key]
 
+    def init_split_head(self, node_id, centers):
+        head = self.add_split_head(node_id)
+        centers = torch.as_tensor(centers, dtype=head.weight.dtype, device=head.weight.device)
+        centers = F.normalize(centers, dim=1)
+        with torch.no_grad():
+            head.weight.copy_(centers)
+            head.bias.zero_()
+        return head
+
     def _prototype_key(self, node_id):
         return str(int(node_id))
 
