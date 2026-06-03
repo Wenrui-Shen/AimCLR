@@ -471,6 +471,7 @@ class ProgressiveRecursiveTree(object):
         assignment_min_ratio = candidate['assignment_min_ratio']
         assignment_min_count = candidate['assignment_min_count']
         gain = candidate['gain']
+        centers = candidate['centers']
         bic_parent = candidate['bic_parent']
         bic_children = candidate['bic_children']
         delta_bic = candidate['delta_bic']
