@@ -33,7 +33,21 @@ def _inertia(x):
     return float(((x - center) ** 2).sum())
 
 
-def _binary_kmeans(x, seed=0, niter=30):
+def _balanced_binary_assignment(dist, min_child_count=1):
+    n = dist.shape[0]
+    if n < 2:
+        return None
+    min_child_count = int(max(1, min(int(min_child_count), n // 2)))
+    margin = dist[:, 0] - dist[:, 1]
+    order = np.argsort(margin)
+    count0 = int((margin <= 0).sum())
+    count0 = min(max(count0, min_child_count), n - min_child_count)
+    labels = np.ones(n, dtype=np.int64)
+    labels[order[:count0]] = 0
+    return labels
+
+
+def _binary_kmeans(x, seed=0, niter=30, min_child_count=1):
     n = x.shape[0]
     if n < 2:
         return None, math.inf, None
@@ -49,11 +63,9 @@ def _binary_kmeans(x, seed=0, niter=30):
     labels = np.zeros(n, dtype=np.int64)
     for _ in range(niter):
         dist = ((x[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-        new_labels = dist.argmin(axis=1).astype(np.int64)
-
-        if np.all(new_labels == 0) or np.all(new_labels == 1):
-            farthest = int(np.argmax(dist.min(axis=1)))
-            new_labels[farthest] = 1 - new_labels[farthest]
+        new_labels = _balanced_binary_assignment(dist, min_child_count=min_child_count)
+        if new_labels is None:
+            return None, math.inf, None
 
         if np.array_equal(labels, new_labels):
             break
@@ -65,9 +77,15 @@ def _binary_kmeans(x, seed=0, niter=30):
                 centers[k] = members.mean(axis=0)
 
     final_dist = ((x[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-    labels = final_dist.argmin(axis=1).astype(np.int64)
-    if np.all(labels == 0) or np.all(labels == 1):
+    labels = _balanced_binary_assignment(final_dist, min_child_count=min_child_count)
+    if labels is None:
         return None, math.inf, None
+    for k in range(2):
+        members = x[labels == k]
+        if len(members) == 0:
+            return None, math.inf, None
+        centers[k] = members.mean(axis=0)
+    final_dist = ((x[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
     inertia = float(final_dist[np.arange(n), labels].sum())
     return labels, inertia, centers
 
@@ -150,6 +168,7 @@ class ProgressiveRecursiveTree(object):
     def __init__(self, num_samples, force_root_split=True, kmeans_iters=30, seed=0,
                  routing_temperature=0.2, depth_penalty_weight=100.0, parent_size_penalty_weight=1.0,
                  tiny_child_penalty_weight=1.0, grow_confidence_threshold=0.9,
+                 balanced_assignment_base_ratio=0.2, balanced_assignment_floor_ratio=0.02,
                  true_labels=None):
         self.num_samples = int(num_samples)
         self.force_root_split = bool(force_root_split)
@@ -160,6 +179,8 @@ class ProgressiveRecursiveTree(object):
         self.parent_size_penalty_weight = float(parent_size_penalty_weight)
         self.tiny_child_penalty_weight = float(tiny_child_penalty_weight)
         self.grow_confidence_threshold = float(grow_confidence_threshold)
+        self.balanced_assignment_base_ratio = float(balanced_assignment_base_ratio)
+        self.balanced_assignment_floor_ratio = float(balanced_assignment_floor_ratio)
         self.true_labels = None if true_labels is None else np.asarray(true_labels)
         self.control_stats = {}
 
@@ -175,6 +196,14 @@ class ProgressiveRecursiveTree(object):
 
     def internal_node_ids(self):
         return sorted([node_id for node_id, node in self.nodes.items() if not node.is_leaf])
+
+    def _min_child_ratio(self, depth):
+        depth_ratio = self.balanced_assignment_base_ratio / float(int(depth) + 1)
+        return max(self.balanced_assignment_floor_ratio, depth_ratio)
+
+    def _min_child_count(self, node, n):
+        ratio = self._min_child_ratio(node.depth)
+        return int(math.ceil(float(n) * ratio))
 
     def update(self, features, epoch):
         features = _l2_normalize(np.asarray(features, dtype=np.float32))
@@ -254,7 +283,8 @@ class ProgressiveRecursiveTree(object):
             children = [self.nodes[child_id] for child_id in node.children]
             x = features[samples]
             labels, _, centers = _binary_kmeans(
-                x, seed=self.seed + self.stage * 3571 + node.node_id, niter=self.kmeans_iters)
+                x, seed=self.seed + self.stage * 3571 + node.node_id,
+                niter=self.kmeans_iters, min_child_count=self._min_child_count(node, len(samples)))
 
             if labels is None or np.bincount(labels, minlength=len(children)).min() == 0:
                 prune_descendants(node)
@@ -292,7 +322,8 @@ class ProgressiveRecursiveTree(object):
 
         x = features[samples]
         labels_a, child_inertia, centers = _binary_kmeans(
-            x, seed=self.seed + self.stage * 7919 + node.node_id, niter=self.kmeans_iters)
+            x, seed=self.seed + self.stage * 7919 + node.node_id,
+            niter=self.kmeans_iters, min_child_count=self._min_child_count(node, n))
         if labels_a is None:
             return None
 
@@ -316,6 +347,8 @@ class ProgressiveRecursiveTree(object):
         min_child = int(counts.min())
         parent_ratio = float(n) / max(float(self.num_samples), 1.0)
         tiny_child_ratio = float(min_child) / max(float(self.num_samples), 1.0)
+        assignment_min_ratio = self._min_child_ratio(node.depth)
+        assignment_min_count = self._min_child_count(node, n)
         return {
             'node': node,
             'n': n,
@@ -325,6 +358,8 @@ class ProgressiveRecursiveTree(object):
             'balance': balance,
             'parent_ratio': parent_ratio,
             'tiny_child_ratio': tiny_child_ratio,
+            'assignment_min_ratio': assignment_min_ratio,
+            'assignment_min_count': assignment_min_count,
             'gain': gain,
             'parent_inertia': parent_inertia,
             'child_inertia': child_inertia,
@@ -381,6 +416,8 @@ class ProgressiveRecursiveTree(object):
         balance = candidate['balance']
         parent_ratio = candidate['parent_ratio']
         tiny_child_ratio = candidate['tiny_child_ratio']
+        assignment_min_ratio = candidate['assignment_min_ratio']
+        assignment_min_count = candidate['assignment_min_count']
         gain = candidate['gain']
         bic_parent = candidate['bic_parent']
         bic_children = candidate['bic_children']
@@ -417,6 +454,8 @@ class ProgressiveRecursiveTree(object):
             'tiny_child_penalty': tiny_child_penalty,
             'parent_ratio': parent_ratio,
             'tiny_child_ratio': tiny_child_ratio,
+            'assignment_min_ratio': assignment_min_ratio,
+            'assignment_min_count': assignment_min_count,
             'parent_top_labels': self._top_labels(samples),
             'child_top_labels': [
                 self._top_labels(samples[labels_a == 0]),

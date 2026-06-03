@@ -44,6 +44,8 @@ class PRC_Processor(Processor):
             parent_size_penalty_weight=self.arg.prc_parent_size_penalty_weight,
             tiny_child_penalty_weight=self.arg.prc_tiny_child_penalty_weight,
             grow_confidence_threshold=self.arg.prc_grow_confidence_threshold,
+            balanced_assignment_base_ratio=self.arg.prc_balanced_assignment_base_ratio,
+            balanced_assignment_floor_ratio=self.arg.prc_balanced_assignment_floor_ratio,
             true_labels=getattr(self.data_loader['train'].dataset, 'label', None))
 
     def load_optimizer(self):
@@ -162,11 +164,12 @@ class PRC_Processor(Processor):
                     '  grow blocked | {}'.format(control['block_reason']))
         for parent_id, stats in split_nodes:
             self.io.print_log(
-                '  split node {} | n {} | counts {} | gain {:.4f} | score {:.2f} | delta_bic {:.2f} | depth_pen {:.2f} | parent_pen {:.2f} | child_pen {:.2f} | parent_ratio {:.4f} | child_ratio {:.4f} | parent_bic {:.2f} | child_bic {:.2f}'.format(
+                '  split node {} | n {} | counts {} | gain {:.4f} | score {:.2f} | delta_bic {:.2f} | depth_pen {:.2f} | parent_pen {:.2f} | child_pen {:.2f} | parent_ratio {:.4f} | child_ratio {:.4f} | assign_min {}@{:.3f} | parent_bic {:.2f} | child_bic {:.2f}'.format(
                     parent_id, stats['n'], stats['counts'], stats['gain'],
                     stats['split_score'], stats['delta_bic'], stats['depth_penalty'],
                     stats['parent_size_penalty'], stats['tiny_child_penalty'],
                     stats['parent_ratio'], stats['tiny_child_ratio'],
+                    stats['assignment_min_count'], stats['assignment_min_ratio'],
                     stats['bic_parent'], stats['bic_children']))
             if stats.get('parent_top_labels') is not None:
                 self.io.print_log(
@@ -467,6 +470,10 @@ class PRC_Processor(Processor):
                             help='weight for parent-size hard PRC split penalty')
         parser.add_argument('--prc_tiny_child_penalty_weight', type=float, default=1.0,
                             help='weight for tiny-child hard PRC split penalty')
+        parser.add_argument('--prc_balanced_assignment_base_ratio', type=float, default=0.2,
+                            help='base minimum child ratio for balanced hard PRC assignment')
+        parser.add_argument('--prc_balanced_assignment_floor_ratio', type=float, default=0.02,
+                            help='floor minimum child ratio for balanced hard PRC assignment')
         parser.add_argument('--prc_entropy_weight', type=float, default=0.05, help='weight for marginal entropy floor')
         parser.add_argument('--prc_entropy_floor', type=float, default=0.35, help='normalized marginal entropy floor')
         parser.add_argument('--prc_leaf_variance_weight', type=float, default=0.05,
