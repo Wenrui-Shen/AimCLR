@@ -40,7 +40,13 @@ class PRC_Processor(Processor):
             kmeans_iters=self.arg.prc_kmeans_iters,
             seed=self.arg.prc_seed,
             routing_temperature=self.arg.prc_routing_temperature,
-            reassign_confidence=self.arg.prc_reassign_confidence)
+            reassign_confidence=self.arg.prc_reassign_confidence,
+            depth_penalty_weight=self.arg.prc_depth_penalty_weight,
+            parent_size_penalty_weight=self.arg.prc_parent_size_penalty_weight,
+            tiny_child_penalty_weight=self.arg.prc_tiny_child_penalty_weight,
+            parent_cluster_ratio=self.arg.prc_parent_cluster_ratio,
+            tiny_child_ratio=self.arg.prc_tiny_child_ratio,
+            true_labels=getattr(self.data_loader['train'].dataset, 'label', None))
 
     def load_optimizer(self):
         if self.arg.optimizer == 'SGD':
@@ -155,9 +161,18 @@ class PRC_Processor(Processor):
                 '  candidates | {}'.format(control['num_candidates']))
         for parent_id, stats in split_nodes:
             self.io.print_log(
-                '  split node {} | n {} | counts {} | gain {:.4f} | delta_bic {:.2f} | parent_bic {:.2f} | child_bic {:.2f}'.format(
+                '  split node {} | n {} | counts {} | gain {:.4f} | score {:.2f} | delta_bic {:.2f} | depth_pen {:.2f} | parent_pen {:.2f} | child_pen {:.2f} | parent_ratio {:.4f} | child_ratio {:.4f} | parent_bic {:.2f} | child_bic {:.2f}'.format(
                     parent_id, stats['n'], stats['counts'], stats['gain'],
-                    stats['delta_bic'], stats['bic_parent'], stats['bic_children']))
+                    stats['split_score'], stats['delta_bic'], stats['depth_penalty'],
+                    stats['parent_size_penalty'], stats['tiny_child_penalty'],
+                    stats['parent_ratio'], stats['tiny_child_ratio'],
+                    stats['bic_parent'], stats['bic_children']))
+            if stats.get('parent_top_labels') is not None:
+                self.io.print_log(
+                    '    top_labels parent {} | child0 {} | child1 {}'.format(
+                        stats['parent_top_labels'],
+                        stats['child_top_labels'][0],
+                        stats['child_top_labels'][1]))
         if self.arg.prc_save_tree:
             self.prc_tree.save(os.path.join(self.arg.work_dir, 'prc_tree_epoch{}.pkl'.format(epoch)))
 
@@ -442,6 +457,16 @@ class PRC_Processor(Processor):
         parser.add_argument('--prc_routing_temperature', type=float, default=0.2, help='soft tree routing temperature')
         parser.add_argument('--prc_reassign_confidence', type=float, default=0.0,
                             help='keep old sibling when soft route confidence is below this value')
+        parser.add_argument('--prc_depth_penalty_weight', type=float, default=100.0,
+                            help='weight for depth-dependent hard PRC split penalty')
+        parser.add_argument('--prc_parent_size_penalty_weight', type=float, default=1.0,
+                            help='weight for parent-size hard PRC split penalty')
+        parser.add_argument('--prc_tiny_child_penalty_weight', type=float, default=1.0,
+                            help='weight for tiny-child hard PRC split penalty')
+        parser.add_argument('--prc_parent_cluster_ratio', type=float, default=0.005,
+                            help='target minimum global ratio for a parent node to split')
+        parser.add_argument('--prc_tiny_child_ratio', type=float, default=0.005,
+                            help='target minimum global ratio for the smaller child in hard PRC splits')
         parser.add_argument('--prc_entropy_weight', type=float, default=0.05, help='weight for marginal entropy floor')
         parser.add_argument('--prc_entropy_floor', type=float, default=0.35, help='normalized marginal entropy floor')
         parser.add_argument('--prc_leaf_variance_weight', type=float, default=0.05,

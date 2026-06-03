@@ -72,6 +72,46 @@ def _binary_kmeans(x, seed=0, niter=30):
     return labels, inertia, centers
 
 
+def _balanced_projection_split(x, centers=None, seed=0):
+    n = x.shape[0]
+    if n < 2:
+        return None, math.inf, None
+
+    if centers is not None:
+        direction = centers[1] - centers[0]
+    else:
+        rng = np.random.RandomState(seed)
+        direction = rng.normal(size=x.shape[1]).astype(np.float32)
+
+    norm = np.linalg.norm(direction)
+    if norm <= 1e-12:
+        centered = x - x.mean(axis=0, keepdims=True)
+        try:
+            _, _, vt = np.linalg.svd(centered, full_matrices=False)
+            direction = vt[0]
+            norm = np.linalg.norm(direction)
+        except np.linalg.LinAlgError:
+            norm = 0.0
+    if norm <= 1e-12:
+        return None, math.inf, None
+
+    score = np.dot(x, direction / norm)
+    order = np.argsort(score)
+    labels = np.zeros(n, dtype=np.int64)
+    labels[order[n // 2:]] = 1
+
+    split_centers = []
+    for k in range(2):
+        members = x[labels == k]
+        if len(members) == 0:
+            return None, math.inf, None
+        split_centers.append(members.mean(axis=0))
+    split_centers = np.stack(split_centers, axis=0).astype(np.float32)
+    final_dist = ((x[:, None, :] - split_centers[None, :, :]) ** 2).sum(axis=2)
+    inertia = float(final_dist[np.arange(n), labels].sum())
+    return labels, inertia, split_centers
+
+
 def _binary_agreement(a, b):
     same = float((a == b).mean())
     flipped = float((a == (1 - b)).mean())
@@ -108,13 +148,22 @@ class ProgressiveRecursiveTree(object):
     """Dynamic binary clustering tree for PRC pseudo labels."""
 
     def __init__(self, num_samples, force_root_split=True, kmeans_iters=30, seed=0,
-                 routing_temperature=0.2, reassign_confidence=0.0):
+                 routing_temperature=0.2, reassign_confidence=0.0,
+                 depth_penalty_weight=100.0, parent_size_penalty_weight=1.0,
+                 tiny_child_penalty_weight=1.0, parent_cluster_ratio=0.005,
+                 tiny_child_ratio=0.005, true_labels=None):
         self.num_samples = int(num_samples)
         self.force_root_split = bool(force_root_split)
         self.kmeans_iters = int(kmeans_iters)
         self.seed = int(seed)
         self.routing_temperature = float(routing_temperature)
         self.reassign_confidence = float(reassign_confidence)
+        self.depth_penalty_weight = float(depth_penalty_weight)
+        self.parent_size_penalty_weight = float(parent_size_penalty_weight)
+        self.tiny_child_penalty_weight = float(tiny_child_penalty_weight)
+        self.parent_cluster_ratio = float(parent_cluster_ratio)
+        self.tiny_child_ratio = float(tiny_child_ratio)
+        self.true_labels = None if true_labels is None else np.asarray(true_labels)
         self.control_stats = {}
 
         self.nodes = {
@@ -237,6 +286,15 @@ class ProgressiveRecursiveTree(object):
         if labels_a is None:
             return None
 
+        is_root_bootstrap = node.node_id == 0 and self.force_root_split and len(node.children) == 0
+        if is_root_bootstrap:
+            labels_b, balanced_inertia, balanced_centers = _balanced_projection_split(
+                x, centers=centers, seed=self.seed + self.stage * 1543 + node.node_id)
+            if labels_b is not None:
+                labels_a = labels_b
+                child_inertia = balanced_inertia
+                centers = balanced_centers
+
         counts = np.bincount(labels_a, minlength=2)
         balance = float(counts.min()) / float(n)
         parent_inertia = _inertia(x)
@@ -245,6 +303,9 @@ class ProgressiveRecursiveTree(object):
         bic_parent = _bic_score(parent_inertia, [n], dim)
         bic_children = _bic_score(child_inertia, counts, dim)
         delta_bic = bic_children - bic_parent
+        min_child = int(counts.min())
+        parent_ratio = float(n) / max(float(self.num_samples), 1.0)
+        tiny_child_ratio = float(min_child) / max(float(self.num_samples), 1.0)
         return {
             'node': node,
             'n': n,
@@ -252,32 +313,83 @@ class ProgressiveRecursiveTree(object):
             'centers': centers,
             'counts': counts,
             'balance': balance,
+            'parent_ratio': parent_ratio,
+            'tiny_child_ratio': tiny_child_ratio,
             'gain': gain,
             'parent_inertia': parent_inertia,
             'child_inertia': child_inertia,
             'bic_parent': bic_parent,
             'bic_children': bic_children,
             'delta_bic': delta_bic,
-            'x': x,
+            'dim': dim,
         }
+
+    def _split_penalties(self, node, n, counts, dim):
+        depth_penalty = (
+            self.depth_penalty_weight *
+            math.log(max(float(n), 1.0)) *
+            float(node.depth + 1) ** 2
+        )
+
+        parent_ratio = float(n) / max(float(self.num_samples), 1.0)
+        parent_target = max(self.parent_cluster_ratio, 1e-12)
+        parent_gap = max(0.0, (parent_target - parent_ratio) / parent_target)
+        parent_size_penalty = (
+            self.parent_size_penalty_weight *
+            float(self.num_samples) *
+            float(dim) *
+            parent_gap ** 2
+        )
+
+        min_child = float(np.min(counts))
+        child_ratio = min_child / max(float(self.num_samples), 1.0)
+        child_target = max(self.tiny_child_ratio, 1e-12)
+        child_gap = max(0.0, (child_target - child_ratio) / child_target)
+        tiny_child_penalty = (
+            self.tiny_child_penalty_weight *
+            float(self.num_samples) *
+            float(dim) *
+            child_gap ** 2
+        )
+        return depth_penalty, parent_size_penalty, tiny_child_penalty
+
+    def _top_labels(self, samples, top_k=3):
+        if self.true_labels is None or len(samples) == 0:
+            return []
+        labels = self.true_labels[np.asarray(samples, dtype=np.int64)]
+        values, counts = np.unique(labels, return_counts=True)
+        order = np.argsort(-counts)[:top_k]
+        total = float(len(samples))
+        top_labels = []
+        for idx in order:
+            value = values[idx]
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                value = str(value)
+            top_labels.append('{}:{:.3f}'.format(value, float(counts[idx]) / max(total, 1.0)))
+        return top_labels
 
     def _try_split_node(self, candidate, epoch):
         node = candidate['node']
         samples = node.samples
         n = candidate['n']
         labels_a = candidate['labels']
-        centers = candidate['centers']
         counts = candidate['counts']
         balance = candidate['balance']
+        parent_ratio = candidate['parent_ratio']
+        tiny_child_ratio = candidate['tiny_child_ratio']
         gain = candidate['gain']
-        child_inertia = candidate['child_inertia']
         bic_parent = candidate['bic_parent']
         bic_children = candidate['bic_children']
         delta_bic = candidate['delta_bic']
-        x = candidate['x']
+        dim = candidate['dim']
+        depth_penalty, parent_size_penalty, tiny_child_penalty = self._split_penalties(
+            node, n, counts, dim)
+        split_score = delta_bic - depth_penalty - parent_size_penalty - tiny_child_penalty
 
         is_root_bootstrap = node.node_id == 0 and self.force_root_split and len(node.children) == 0
-        accept = is_root_bootstrap or delta_bic > 0
+        accept = is_root_bootstrap or split_score > 0
         if not accept:
             return None
 
@@ -297,6 +409,17 @@ class ProgressiveRecursiveTree(object):
             'balance': balance,
             'gain': gain,
             'score': delta_bic,
+            'split_score': split_score,
+            'depth_penalty': depth_penalty,
+            'parent_size_penalty': parent_size_penalty,
+            'tiny_child_penalty': tiny_child_penalty,
+            'parent_ratio': parent_ratio,
+            'tiny_child_ratio': tiny_child_ratio,
+            'parent_top_labels': self._top_labels(samples),
+            'child_top_labels': [
+                self._top_labels(samples[labels_a == 0]),
+                self._top_labels(samples[labels_a == 1]),
+            ],
             'bic_parent': bic_parent,
             'bic_children': bic_children,
             'delta_bic': delta_bic,

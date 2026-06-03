@@ -47,6 +47,11 @@ prc_force_root_split: True
 prc_kmeans_iters: 30
 prc_routing_temperature: 0.2
 prc_reassign_confidence: 0.0
+prc_depth_penalty_weight: 100.0
+prc_parent_size_penalty_weight: 1.0
+prc_tiny_child_penalty_weight: 1.0
+prc_parent_cluster_ratio: 0.005
+prc_tiny_child_ratio: 0.005
 prc_entropy_weight: 0.05
 prc_entropy_floor: 0.35
 prc_leaf_variance_weight: 0.05
