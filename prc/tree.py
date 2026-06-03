@@ -423,6 +423,42 @@ class ProgressiveRecursiveTree(object):
             top_labels.append('{}:{:.3f}'.format(value, float(counts[idx]) / max(total, 1.0)))
         return top_labels
 
+    def leaf_label_summary(self, top_k=3, max_leaves=5):
+        if self.true_labels is None:
+            return None
+        leaf_infos = []
+        purities = []
+        for node in self.leaves():
+            n = len(node.samples)
+            if n == 0:
+                purity = 0.0
+                top_labels = []
+            else:
+                top_labels = self._top_labels(node.samples, top_k=top_k)
+                purity = 0.0
+                if top_labels:
+                    try:
+                        purity = float(str(top_labels[0]).split(':')[-1])
+                    except (TypeError, ValueError):
+                        purity = 0.0
+            purities.append(purity)
+            leaf_infos.append({
+                'node_id': node.node_id,
+                'depth': node.depth,
+                'n': int(n),
+                'purity': purity,
+                'top_labels': top_labels,
+            })
+        if not leaf_infos:
+            return None
+        leaf_infos.sort(key=lambda item: (-item['n'], item['node_id']))
+        return {
+            'mean_purity': float(np.mean(purities)),
+            'min_purity': float(np.min(purities)),
+            'max_purity': float(np.max(purities)),
+            'top_leaves': leaf_infos[:max(0, int(max_leaves))],
+        }
+
     def _try_split_node(self, candidate, epoch):
         node = candidate['node']
         samples = node.samples

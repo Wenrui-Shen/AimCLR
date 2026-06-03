@@ -177,6 +177,17 @@ class PRC_Processor(Processor):
             if control.get('growth_blocked'):
                 self.io.print_log(
                     '  grow blocked | {}'.format(control['block_reason']))
+        leaf_labels = self.prc_tree.leaf_label_summary(top_k=3, max_leaves=5)
+        if leaf_labels is not None:
+            self.io.print_log(
+                '  leaf_purity | mean {:.4f} | min {:.4f} | max {:.4f}'.format(
+                    leaf_labels['mean_purity'],
+                    leaf_labels['min_purity'],
+                    leaf_labels['max_purity']))
+            for leaf in leaf_labels['top_leaves']:
+                self.io.print_log(
+                    '    leaf {} | depth {} | n {} | top_labels {}'.format(
+                        leaf['node_id'], leaf['depth'], leaf['n'], leaf['top_labels']))
         for parent_id, stats in split_nodes:
             self.io.print_log(
                 '  split node {} | n {} | counts {} | gain {:.4f} | score {:.2f} | delta_bic {:.2f} | depth_pen {:.2f} | parent_pen {:.2f} | child_pen {:.2f} | parent_ratio {:.4f} | child_ratio {:.4f} | assign_min {}@{:.3f} | parent_bic {:.2f} | child_bic {:.2f}'.format(
