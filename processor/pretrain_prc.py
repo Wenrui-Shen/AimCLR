@@ -164,9 +164,10 @@ class PRC_Processor(Processor):
         self._sync_heads_with_tree(split_nodes)
         summary = self.prc_tree.summary()
         self.io.print_log(
-            'PRC stage {} | splits {} | reassign_changed {} | route_conf {:.4f} | nodes {} | leaves {} | max_depth {} | leaf_size {}-{}'.format(
+            'PRC stage {} | splits {} | reassign_changed {} | route_conf {:.4f} | align_flip {} | nodes {} | leaves {} | max_depth {} | leaf_size {}-{}'.format(
                 self.prc_tree.stage, len(split_nodes),
                 reassign_stats['num_changed'], reassign_stats['mean_confidence'],
+                reassign_stats.get('num_aligned_flips', 0),
                 summary['num_nodes'], summary['num_leaves'],
                 summary['max_depth'], summary['min_leaf_size'], summary['max_leaf_size']))
         control = self.prc_tree.control_stats

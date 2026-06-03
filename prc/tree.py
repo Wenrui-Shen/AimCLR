@@ -256,6 +256,7 @@ class ProgressiveRecursiveTree(object):
             'num_internal': len(self.internal_node_ids()),
             'num_changed': 0,
             'mean_confidence': 0.0,
+            'num_aligned_flips': 0,
         }
         confidences = []
 
@@ -289,6 +290,21 @@ class ProgressiveRecursiveTree(object):
             if labels is None or np.bincount(labels, minlength=len(children)).min() == 0:
                 prune_descendants(node)
                 return
+
+            old_child_samples = [child.samples.copy() for child in children]
+            new_child_samples = [samples[labels == child_pos] for child_pos in range(len(children))]
+            same_overlap = (
+                np.intersect1d(new_child_samples[0], old_child_samples[0], assume_unique=False).size +
+                np.intersect1d(new_child_samples[1], old_child_samples[1], assume_unique=False).size
+            )
+            flipped_overlap = (
+                np.intersect1d(new_child_samples[0], old_child_samples[1], assume_unique=False).size +
+                np.intersect1d(new_child_samples[1], old_child_samples[0], assume_unique=False).size
+            )
+            if flipped_overlap > same_overlap:
+                labels = 1 - labels
+                centers = centers[[1, 0]]
+                stats['num_aligned_flips'] += 1
 
             centers = _l2_normalize(centers.astype(np.float32))
             sims = np.dot(x, centers.T)
