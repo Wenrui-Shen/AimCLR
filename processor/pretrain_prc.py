@@ -104,6 +104,22 @@ class PRC_Processor(Processor):
             raise ValueError('Unsupported PRC batch format')
         return data_pack, label, index
 
+    def _select_view(self, data_pack, view_index):
+        if not isinstance(data_pack, (list, tuple)):
+            return data_pack
+        if len(data_pack) == 0:
+            raise ValueError('Empty PRC data pack')
+        view_index = int(view_index)
+        if view_index < 0:
+            view_index = len(data_pack) + view_index
+        view_index = min(max(view_index, 0), len(data_pack) - 1)
+        return data_pack[view_index]
+
+    def _prepare_data_view(self, data_pack, view_index):
+        data = self._select_view(data_pack, view_index)
+        data = data.float().to(self.dev, non_blocking=True)
+        return self._prepare_stream(data)
+
     def _extract_features(self):
         dataset = self.data_loader['train'].dataset
         loader = torch.utils.data.DataLoader(
@@ -121,9 +137,7 @@ class PRC_Processor(Processor):
         with torch.no_grad():
             for batch in loader:
                 data_pack, _, index = self._parse_batch(batch)
-                data = data_pack[1] if isinstance(data_pack, (list, tuple)) else data_pack
-                data = data.float().to(self.dev, non_blocking=True)
-                data = self._prepare_stream(data)
+                data = self._prepare_data_view(data_pack, self.arg.prc_target_view)
                 z = self._model_core().forward_features(data)
                 features[index.numpy()] = z.detach().cpu().numpy()
 
@@ -180,9 +194,11 @@ class PRC_Processor(Processor):
         if self.arg.prc_save_tree:
             self.prc_tree.save(os.path.join(self.arg.work_dir, 'prc_tree_epoch{}.pkl'.format(epoch)))
 
-    def _path_loss(self, logits, index):
+    def _path_loss(self, logits, index, ce_weight=None, entropy_weight=None):
         if index is None:
             raise ValueError('Hard PRC requires train_feeder_args.return_index: True')
+        ce_weight = self.arg.prc_ce_weight if ce_weight is None else float(ce_weight)
+        entropy_weight = self.arg.prc_entropy_weight if entropy_weight is None else float(entropy_weight)
         targets = self.prc_tree.targets_for_indices(index.detach().cpu().numpy())
         losses = []
         weights = []
@@ -199,7 +215,7 @@ class PRC_Processor(Processor):
             losses.append(loss * weight)
             weights.append(weight)
 
-            if self.arg.prc_entropy_weight > 0 and mask.sum().item() >= self.arg.prc_entropy_min_samples:
+            if entropy_weight > 0 and mask.sum().item() >= self.arg.prc_entropy_min_samples:
                 probs = torch.softmax(logits[parent_id][mask], dim=1)
                 marginal = probs.mean(dim=0)
                 entropy = -(marginal * torch.log(marginal.clamp_min(1e-12))).sum()
@@ -214,7 +230,7 @@ class PRC_Processor(Processor):
             entropy_loss = sum(entropy_penalties) / max(sum(weights), 1e-12)
         else:
             entropy_loss = ce_loss.new_tensor(0.0)
-        loss = self.arg.prc_ce_weight * ce_loss + self.arg.prc_entropy_weight * entropy_loss
+        loss = ce_weight * ce_loss + entropy_weight * entropy_loss
         return loss, ce_loss, entropy_loss
 
     def _leaf_probabilities(self, logits, reference):
@@ -380,15 +396,14 @@ class PRC_Processor(Processor):
         for batch in loader:
             self.global_step += 1
             data_pack, _, index = self._parse_batch(batch)
-            data = data_pack[1] if isinstance(data_pack, (list, tuple)) else data_pack
-            data = data.float().to(self.dev, non_blocking=True)
-            data = self._prepare_stream(data)
+            data = self._prepare_data_view(data_pack, self.arg.prc_target_view)
 
             if self.arg.prc_mode == 'soft':
                 out = self._model_core().forward_soft(data, temperature=self.arg.prc_soft_temperature)
                 loss, stats = self._soft_tree_loss(out, epoch)
                 ce_loss = stats['compact']
                 entropy_loss = stats['mean_leaf_entropy']
+                consistency_loss = ce_loss.new_tensor(0.0)
                 leaf_variance_loss = ce_loss.new_tensor(0.0)
                 prc_nodes = len(self._model_core().soft_internal_ids)
                 batch_size = data.size(0)
@@ -408,6 +423,21 @@ class PRC_Processor(Processor):
                 loss, ce_loss, entropy_loss = self._path_loss(logits, index)
                 if loss is None:
                     continue
+                consistency_loss = loss.new_tensor(0.0)
+                if (
+                    self.arg.prc_consistency_weight > 0 and
+                    isinstance(data_pack, (list, tuple)) and
+                    len(data_pack) > 1
+                ):
+                    cons_data = self._prepare_data_view(data_pack, self.arg.prc_consistency_view)
+                    cons_logits, _ = self._model_core()(cons_data, node_ids=node_ids)
+                    cons_loss, cons_ce, _ = self._path_loss(
+                        cons_logits, index,
+                        ce_weight=self.arg.prc_consistency_weight,
+                        entropy_weight=0.0)
+                    if cons_loss is not None:
+                        loss = loss + cons_loss
+                        consistency_loss = cons_ce
                 leaf_variance_loss = self._leaf_variance_loss(logits, features, loss)
                 loss = loss + self.arg.prc_leaf_variance_weight * leaf_variance_loss
                 prc_nodes = len(node_ids)
@@ -418,6 +448,7 @@ class PRC_Processor(Processor):
 
             self.iter_info['loss'] = loss.data.item()
             self.iter_info['ce'] = ce_loss.data.item()
+            self.iter_info['cons'] = consistency_loss.data.item()
             self.iter_info['ent'] = entropy_loss.data.item()
             self.iter_info['var'] = leaf_variance_loss.data.item()
             self.iter_info['lr'] = '{:.6f}'.format(self.lr)
@@ -462,6 +493,12 @@ class PRC_Processor(Processor):
         parser.add_argument('--prc_routing_temperature', type=float, default=0.2, help='soft tree routing temperature')
         parser.add_argument('--prc_grow_confidence_threshold', type=float, default=0.9,
                             help='skip hard PRC growth when mean route confidence is below this value')
+        parser.add_argument('--prc_target_view', type=int, default=1,
+                            help='view index used for hard PRC tree updates and path targets')
+        parser.add_argument('--prc_consistency_view', type=int, default=0,
+                            help='view index used for hard PRC augmentation consistency')
+        parser.add_argument('--prc_consistency_weight', type=float, default=0.0,
+                            help='weight for hard PRC path consistency on another augmented view')
         parser.add_argument('--prc_ce_weight', type=float, default=1.0,
                             help='weight for hard PRC path cross entropy')
         parser.add_argument('--prc_depth_penalty_weight', type=float, default=100.0,

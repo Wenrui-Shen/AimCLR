@@ -47,9 +47,12 @@ prc_force_root_split: True
 prc_kmeans_iters: 30
 prc_routing_temperature: 0.2
 prc_grow_confidence_threshold: 0.9
+prc_target_view: 1
+prc_consistency_view: 2
+prc_consistency_weight: 3.0
 prc_balanced_assignment_base_ratio: 0.2
 prc_balanced_assignment_floor_ratio: 0.02
-prc_ce_weight: 5.0
+prc_ce_weight: 3.0
 prc_depth_penalty_weight: 2000.0
 prc_parent_size_penalty_weight: 2.0
 prc_tiny_child_penalty_weight: 0.25
