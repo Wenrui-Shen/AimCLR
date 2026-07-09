@@ -3,8 +3,8 @@ work_dir: ./data/ntu60_cs/ose_aimclr_joint/pretext
 # feeder
 train_feeder: feeder.ntu_feeder.Feeder_triple
 train_feeder_args:
-  data_path: /data/gty/action_dataset/ntu60_frame50/xsub/train_position.npy
-  label_path: /data/gty/action_dataset/ntu60_frame50/xsub/train_label.pkl
+  data_path: ../data/pstl/xsub/train_position.npy
+  label_path: ../data/pstl/xsub/train_label.pkl
   shear_amplitude: 0.5
   temperal_padding_ratio: 6
   mmap: True
