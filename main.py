@@ -34,6 +34,7 @@ if __name__ == '__main__':
     processors = dict()
 
     processors['pretrain_aimclr'] = import_class('processor.pretrain_aimclr.AimCLR_Processor')
+    processors['pretrain_ose_aimclr'] = import_class('processor.pretrain_ose_aimclr.OSEAimCLR_Processor')
     processors['pretrain_prc'] = import_class('processor.pretrain_prc.PRC_Processor')
     processors['linear_evaluation'] = import_class('processor.linear_evaluation.LE_Processor')
     processors['finetune_evaluation'] = import_class('processor.finetune_evaluation.FT_Processor')
