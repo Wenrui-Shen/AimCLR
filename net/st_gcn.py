@@ -50,7 +50,7 @@ class Model(nn.Module):
             self.edge_importance = [1] * len(self.st_gcn_networks)
         
 
-    def forward(self, x, drop=False):
+    def forward_features(self, x, drop=False):
 
         # data normalization
         N, C, T, V, M = x.size()
@@ -67,33 +67,21 @@ class Model(nn.Module):
 
         if drop:
             y = self.dropout(x)
-            # global pooling
             x = F.avg_pool2d(x, x.size()[2:])
             x = x.view(N, M, -1).mean(dim=1)
-
-            # prediction
-            x = self.fc(x)
-            x = x.view(x.size(0), -1)
-
-            # global pooling
             y = F.avg_pool2d(y, y.size()[2:])
             y = y.view(N, M, -1).mean(dim=1)
-
-            # prediction
-            y = self.fc(y)
-            y = y.view(y.size(0), -1)
-
             return x, y
-        else:
-            # global pooling
-            x = F.avg_pool2d(x, x.size()[2:])
-            x = x.view(N, M, -1).mean(dim=1)
 
-            # prediction
-            x = self.fc(x)
-            x = x.view(x.size(0), -1)
+        x = F.avg_pool2d(x, x.size()[2:])
+        return x.view(N, M, -1).mean(dim=1)
 
-            return x
+    def forward(self, x, drop=False):
+        features = self.forward_features(x, drop=drop)
+        if drop:
+            x, y = features
+            return self.fc(x).view(x.size(0), -1), self.fc(y).view(y.size(0), -1)
+        return self.fc(features).view(features.size(0), -1)
 
 
 class st_gcn(nn.Module):

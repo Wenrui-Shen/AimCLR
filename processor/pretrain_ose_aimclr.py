@@ -95,18 +95,20 @@ class OSEAimCLR_Processor(AimCLR_Processor):
         return self._prepare_stream(data)
 
     def _ose_weight(self, epoch):
-        if epoch <= self.arg.ose_warmup_epoch:
-            return 0.0
-        if self.arg.ose_ramp_epoch <= 0:
-            return 1.0
-        progress = float(epoch - self.arg.ose_warmup_epoch) / float(self.arg.ose_ramp_epoch)
-        return min(max(progress, 0.0), 1.0)
+        return 0.0 if epoch <= self.arg.ose_warmup_epoch else 1.0
+
+    def _activate_ose(self):
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        model.activate_ose()
 
     def train(self, epoch):
         self.model.train()
         self.adjust_lr()
         loader = self.data_loader['train']
         loss_value = []
+
+        if self._ose_weight(epoch) > 0:
+            self._activate_ose()
 
         for batch in loader:
             self.global_step += 1
@@ -159,9 +161,17 @@ class OSEAimCLR_Processor(AimCLR_Processor):
             base_loss = loss1 + (loss2 + loss3) / 2.
             proto_loss = base_loss.new_tensor(0.0)
             mix_loss = base_loss.new_tensor(0.0)
+            align_loss = base_loss.new_tensor(0.0)
+            disp_loss = base_loss.new_tensor(0.0)
+            mix_proto_loss = base_loss.new_tensor(0.0)
+            mix_ins_loss = base_loss.new_tensor(0.0)
             if ose_losses is not None:
                 proto_loss = ose_losses['proto']
                 mix_loss = ose_losses['mix']
+                align_loss = ose_losses['align']
+                disp_loss = ose_losses['disp']
+                mix_proto_loss = ose_losses['mix_proto']
+                mix_ins_loss = ose_losses['mix_ins']
             loss = base_loss + ose_weight * (
                 self.arg.ose_lambda * proto_loss +
                 self.arg.ose_mu * mix_loss
@@ -175,6 +185,10 @@ class OSEAimCLR_Processor(AimCLR_Processor):
             self.iter_info['base'] = base_loss.data.item()
             self.iter_info['proto'] = proto_loss.data.item()
             self.iter_info['mix'] = mix_loss.data.item()
+            self.iter_info['align'] = align_loss.data.item()
+            self.iter_info['disp'] = disp_loss.data.item()
+            self.iter_info['mix_p'] = mix_proto_loss.data.item()
+            self.iter_info['mix_i'] = mix_ins_loss.data.item()
             self.iter_info['ose_w'] = '{:.3f}'.format(ose_weight)
             self.iter_info['lr'] = '{:.6f}'.format(self.lr)
             loss_value.append(self.iter_info['loss'])
@@ -202,8 +216,6 @@ class OSEAimCLR_Processor(AimCLR_Processor):
                             help='optional .npy path to load/save selected exemplar indices')
         parser.add_argument('--ose_warmup_epoch', type=int, default=20,
                             help='epochs trained with plain AimCLR before enabling OSE losses')
-        parser.add_argument('--ose_ramp_epoch', type=int, default=20,
-                            help='epochs used to linearly ramp OSE loss weights after warmup')
         parser.add_argument('--ose_topk', type=int, default=8,
                             help='nearest memory neighbors per exemplar prototype')
         parser.add_argument('--ose_alpha', type=float, default=0.75,

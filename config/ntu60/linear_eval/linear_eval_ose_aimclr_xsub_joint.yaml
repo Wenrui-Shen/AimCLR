@@ -1,7 +1,7 @@
 work_dir: ./data/ntu60_cs/ose_aimclr_joint/linear_eval
 
 weights: ./data/ntu60_cs/ose_aimclr_joint/pretext/epoch300_model.pt
-ignore_weights: [encoder_q.fc, encoder_k, queue]
+ignore_weights: [encoder_q.fc, encoder_k, queue, ose_projector_q, ose_projector_k, ose_queue, ose_initialized]
 
 # feeder
 train_feeder: feeder.ntu_feeder.Feeder_single
