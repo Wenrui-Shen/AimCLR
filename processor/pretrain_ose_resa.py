@@ -172,11 +172,16 @@ class OSEResAProcessor(PT_Processor):
         for batch_index, batch in enumerate(loader):
             self.global_step += 1
             data_pack = self._parse_batch(batch)
-            strong_view, weak_view, _ = data_pack
-            strong_view = self._prepare_stream(
-                strong_view.float().to(self.dev, non_blocking=True))
-            weak_view = self._prepare_stream(
-                weak_view.float().to(self.dev, non_blocking=True))
+            if len(data_pack) == 2:
+                weak_view_a, weak_view_b = data_pack
+            elif len(data_pack) == 3:
+                _, weak_view_a, weak_view_b = data_pack
+            else:
+                raise ValueError('ReSA requires exactly two weak views')
+            weak_view_a = self._prepare_stream(
+                weak_view_a.float().to(self.dev, non_blocking=True))
+            weak_view_b = self._prepare_stream(
+                weak_view_b.float().to(self.dev, non_blocking=True))
             exemplar = self._exemplar_batch()
 
             progress = self._training_progress(
@@ -185,7 +190,7 @@ class OSEResAProcessor(PT_Processor):
             momentum = self._momentum(progress)
 
             losses = self.model(
-                weak_view, strong_view, exemplar,
+                weak_view_a, weak_view_b, exemplar,
                 momentum=momentum, ose_topk=self.arg.ose_topk,
                 ose_alpha=self.arg.ose_alpha,
                 ose_tau_s=self.arg.ose_tau_s,
@@ -198,6 +203,8 @@ class OSEResAProcessor(PT_Processor):
 
             self.iter_info['loss'] = loss.item()
             self.iter_info['cluster'] = losses['cluster'].item()
+            self.iter_info['cluster_h'] = losses['cluster_entropy'].item()
+            self.iter_info['cluster_kl'] = losses['cluster_kl'].item()
             self.iter_info['proto'] = losses['proto'].item()
             self.iter_info['align'] = losses['align'].item()
             self.iter_info['disp'] = losses['disp'].item()

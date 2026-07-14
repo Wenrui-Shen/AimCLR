@@ -37,9 +37,9 @@ def _build_predictor(input_dim, hidden_dim):
 class OSEResA(nn.Module):
     """ReSA with the exemplar-guided prototype loss from OSESSL."""
 
-    def __init__(self, base_encoder=None, pretrain=True, feature_dim=512,
+    def __init__(self, base_encoder=None, pretrain=True, feature_dim=256,
                  projector_hidden_dim=2048, projector_layers=3,
-                 use_predictor=True, queue_size=4096,
+                 use_predictor=True, queue_size=8192,
                  cluster_temperature=0.4, sinkhorn_temperature=0.05,
                  sinkhorn_iterations=3, in_channels=3, hidden_channels=16,
                  hidden_dim=256, num_class=60, dropout=0.5,
@@ -178,49 +178,49 @@ class OSEResA(nn.Module):
         self.queue_filled[0] = min(
             self.queue_size, int(self.queue_filled.item()) + count)
 
-    def _online_embeddings(self, weak_view, strong_view, exemplar):
-        weak_features = self.encoder_q.forward_features(weak_view)
-        strong_features = self.encoder_q.forward_features(strong_view)
+    def _online_embeddings(self, view_a, view_b, exemplar):
+        view_a_features = self.encoder_q.forward_features(view_a)
+        view_b_features = self.encoder_q.forward_features(view_b)
         exemplar_features = self.encoder_q.forward_features(exemplar)
 
-        weak_embedding = F.normalize(
-            self.predictor(self.projector_q(weak_features)), dim=1)
-        strong_embedding = F.normalize(
-            self.predictor(self.projector_q(strong_features)), dim=1)
+        view_a_embedding = F.normalize(
+            self.predictor(self.projector_q(view_a_features)), dim=1)
+        view_b_embedding = F.normalize(
+            self.predictor(self.projector_q(view_b_features)), dim=1)
         exemplar_embedding = F.normalize(
             self.predictor(self.projector_q(exemplar_features)), dim=1)
 
-        features = [F.normalize(weak_features, dim=1),
-                    F.normalize(strong_features, dim=1)]
-        embeddings = [weak_embedding, strong_embedding]
+        features = [F.normalize(view_a_features, dim=1),
+                    F.normalize(view_b_features, dim=1)]
+        embeddings = [view_a_embedding, view_b_embedding]
         return features, embeddings, exemplar_embedding
 
     @torch.no_grad()
-    def _teacher_embeddings(self, weak_view, strong_view):
-        weak_features = self.encoder_k.forward_features(weak_view)
-        strong_features = self.encoder_k.forward_features(strong_view)
-        features = [F.normalize(weak_features, dim=1),
-                    F.normalize(strong_features, dim=1)]
+    def _teacher_embeddings(self, view_a, view_b):
+        view_a_features = self.encoder_k.forward_features(view_a)
+        view_b_features = self.encoder_k.forward_features(view_b)
+        features = [F.normalize(view_a_features, dim=1),
+                    F.normalize(view_b_features, dim=1)]
         embeddings = [
-            F.normalize(self.projector_k(weak_features), dim=1),
-            F.normalize(self.projector_k(strong_features), dim=1),
+            F.normalize(self.projector_k(view_a_features), dim=1),
+            F.normalize(self.projector_k(view_b_features), dim=1),
         ]
         return features, embeddings
 
-    def forward(self, weak_view, strong_view=None, exemplar=None,
+    def forward(self, view_a, view_b=None, exemplar=None,
                 momentum=0.996, ose_topk=8, ose_alpha=0.75,
                 ose_tau_s=0.04, ose_tau_t=0.1):
         if not self.pretrain:
-            return self.encoder_q(weak_view)
-        if strong_view is None or exemplar is None:
-            raise ValueError('ReSA+Lproto requires weak, strong, and exemplar inputs')
+            return self.encoder_q(view_a)
+        if view_b is None or exemplar is None:
+            raise ValueError('ReSA+Lproto requires two views and exemplar inputs')
 
         online_h, online_z, exemplar_z = self._online_embeddings(
-            weak_view, strong_view, exemplar)
+            view_a, view_b, exemplar)
         with torch.no_grad():
             self._momentum_update(momentum)
             teacher_h, teacher_z = self._teacher_embeddings(
-                weak_view, strong_view)
+                view_a, view_b)
 
         assignment = self._sinkhorn_knopp(
             torch.matmul(online_h[0].detach(), teacher_h[0].t()))
@@ -237,6 +237,9 @@ class OSEResA(nn.Module):
                     logits, assignment)
                 terms += 1
         cluster_loss = cluster_loss / max(terms, 1)
+        cluster_entropy = -(
+            assignment * assignment.clamp_min(1e-12).log()
+        ).sum(dim=1).mean()
 
         prototypes = self._class_prototypes(
             exemplar_z, topk=ose_topk, alpha=ose_alpha)
@@ -265,6 +268,8 @@ class OSEResA(nn.Module):
 
         return {
             'cluster': cluster_loss,
+            'cluster_entropy': cluster_entropy,
+            'cluster_kl': cluster_loss - cluster_entropy,
             'proto': proto_loss,
             'align': align_loss,
             'disp': disp_loss,

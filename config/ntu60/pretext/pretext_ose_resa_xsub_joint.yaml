@@ -1,7 +1,7 @@
-work_dir: ./data/ntu60_cs/ose_resa_joint/pretext
+work_dir: ./data/ntu60_cs/ose_resa_weak_joint/pretext
 
 # feeder
-train_feeder: feeder.ntu_feeder.Feeder_triple
+train_feeder: feeder.ntu_feeder.Feeder_double
 train_feeder_args:
   data_path: ../data/pstl/xsub/train_position.npy
   label_path: ../data/pstl/xsub/train_label.pkl
@@ -14,11 +14,11 @@ model: net.ose_resa.OSEResA
 model_args:
   base_encoder: net.st_gcn.Model
   pretrain: True
-  feature_dim: 512
+  feature_dim: 256
   projector_hidden_dim: 2048
   projector_layers: 3
   use_predictor: True
-  queue_size: 4096
+  queue_size: 8192
   cluster_temperature: 0.4
   sinkhorn_temperature: 0.05
   sinkhorn_iterations: 3
@@ -52,7 +52,7 @@ stream: 'joint'
 # one-shot exemplar prototype learning
 ose_num_class: 60
 ose_exemplar_seed: 0
-ose_exemplar_index_path: ./data/ntu60_cs/ose_resa_joint/exemplar_seed0.npy
+ose_exemplar_index_path: ./data/ntu60_cs/ose_resa_weak_joint/exemplar_seed0.npy
 ose_topk: 8
 ose_alpha: 0.75
 ose_tau_s: 0.04

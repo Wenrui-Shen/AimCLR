@@ -124,6 +124,19 @@ class Feeder_triple(torch.utils.data.Dataset):
         return data_numpy
 
 
+class Feeder_double(Feeder_triple):
+    """Feeder for two independently weak-augmented views."""
+
+    def __getitem__(self, index):
+        data_numpy = np.array(self.data[index])
+        label = self.label[index]
+        data1 = self._aug(data_numpy)
+        data2 = self._aug(data_numpy)
+        if self.return_index:
+            return [data1, data2], label, index
+        return [data1, data2], label
+
+
 class Feeder_semi(torch.utils.data.Dataset):
     """ Feeder for single inputs """
 
