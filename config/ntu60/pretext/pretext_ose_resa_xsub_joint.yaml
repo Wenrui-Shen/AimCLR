@@ -8,6 +8,7 @@ train_feeder_args:
   shear_amplitude: 0.5
   temperal_padding_ratio: 6
   mmap: True
+  return_index: True
 
 # model
 model: net.ose_resa.OSEResA
@@ -55,8 +56,8 @@ ose_exemplar_seed: 0
 ose_exemplar_index_path: ./data/ntu60_cs/ose_resa_weak_joint/exemplar_seed0.npy
 ose_topk: 8
 ose_alpha: 0.75
-ose_tau_s: 0.04
-ose_tau_t: 0.1
+ose_tau_s: 0.1
+ose_tau_t: 0.04
 ose_lambda: 1.0
 
 # log

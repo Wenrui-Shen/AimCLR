@@ -220,9 +220,9 @@ class OSEAimCLR_Processor(AimCLR_Processor):
                             help='nearest memory neighbors per exemplar prototype')
         parser.add_argument('--ose_alpha', type=float, default=0.75,
                             help='discriminative neighbor score balance')
-        parser.add_argument('--ose_tau_s', type=float, default=0.04,
+        parser.add_argument('--ose_tau_s', type=float, default=0.1,
                             help='student temperature for prototype and mix losses')
-        parser.add_argument('--ose_tau_t', type=float, default=0.1,
+        parser.add_argument('--ose_tau_t', type=float, default=0.04,
                             help='teacher temperature for prototype targets')
         parser.add_argument('--ose_lambda', type=float, default=1.0,
                             help='weight for exemplar-guided prototype loss')

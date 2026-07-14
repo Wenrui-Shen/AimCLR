@@ -55,8 +55,8 @@ ose_exemplar_index_path: ./data/ntu60_cs/ose_aimclr_joint/exemplar_seed0.npy
 ose_warmup_epoch: 20
 ose_topk: 8
 ose_alpha: 0.75
-ose_tau_s: 0.04
-ose_tau_t: 0.1
+ose_tau_s: 0.1
+ose_tau_t: 0.04
 ose_lambda: 1.0
 ose_mu: 1.0
 ose_mix_alpha: 1.0

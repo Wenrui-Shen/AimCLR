@@ -186,7 +186,7 @@ class OSEAimCLR(AimCLR):
     def forward(self, im_q_extreme, im_q, im_k=None, nnm=False, topk=1,
                 exemplar=None, im_mix=None, mix_index=None, mix_beta=None,
                 compute_ose=False, ose_topk=8, ose_alpha=0.75,
-                ose_tau_s=0.04, ose_tau_t=0.1):
+                ose_tau_s=0.1, ose_tau_t=0.04):
         if not self.pretrain:
             return self.encoder_q(im_q)
 

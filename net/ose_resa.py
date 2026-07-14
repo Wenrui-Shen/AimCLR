@@ -78,6 +78,9 @@ class OSEResA(nn.Module):
         self.register_buffer('queue', torch.zeros(feature_dim, queue_size))
         self.register_buffer('queue_ptr', torch.zeros(1, dtype=torch.long))
         self.register_buffer('queue_filled', torch.zeros(1, dtype=torch.long))
+        self.register_buffer(
+            'queue_sample_indices',
+            torch.full((queue_size,), -1, dtype=torch.long))
         self.reset_momentum_encoder()
 
     @torch.no_grad()
@@ -128,7 +131,10 @@ class OSEResA(nn.Module):
         exemplar_z = F.normalize(exemplar_z, dim=1)
         filled = int(self.queue_filled.item())
         if filled == 0:
-            return exemplar_z
+            neighbor_sample_indices = torch.empty(
+                exemplar_z.size(0), 0, dtype=torch.long,
+                device=exemplar_z.device)
+            return exemplar_z, neighbor_sample_indices
 
         memory = F.normalize(self.queue[:, :filled].detach().t(), dim=1)
         similarity = torch.matmul(exemplar_z, memory.t())
@@ -148,6 +154,8 @@ class OSEResA(nn.Module):
         neighbor_count = min(int(topk), memory.size(0))
         neighbor_indices = torch.topk(
             score, k=neighbor_count, dim=1).indices
+        neighbor_sample_indices = self.queue_sample_indices[
+            :filled][neighbor_indices].detach()
 
         prototypes = []
         for class_index in range(exemplar_z.size(0)):
@@ -158,21 +166,34 @@ class OSEResA(nn.Module):
                 torch.matmul(components, exemplar_z[class_index]), dim=0)
             prototypes.append(
                 torch.sum(weights.unsqueeze(1) * components, dim=0))
-        return torch.stack(prototypes, dim=0)
+        return torch.stack(prototypes, dim=0), neighbor_sample_indices
 
     @torch.no_grad()
-    def _dequeue_and_enqueue(self, keys):
+    def _dequeue_and_enqueue(self, keys, sample_indices=None):
         keys = keys.detach()
+        if sample_indices is None:
+            sample_indices = torch.full(
+                (keys.size(0),), -1, dtype=torch.long, device=keys.device)
+        else:
+            sample_indices = sample_indices.detach().to(
+                device=keys.device, dtype=torch.long).view(-1)
+        if sample_indices.size(0) != keys.size(0):
+            raise ValueError('Queue keys and sample indices must align')
         if keys.size(0) >= self.queue_size:
             keys = keys[-self.queue_size:]
+            sample_indices = sample_indices[-self.queue_size:]
 
         count = keys.size(0)
         ptr = int(self.queue_ptr.item())
         first_count = min(count, self.queue_size - ptr)
         self.queue[:, ptr:ptr + first_count] = keys[:first_count].t()
+        self.queue_sample_indices[ptr:ptr + first_count] = (
+            sample_indices[:first_count])
         remaining = count - first_count
         if remaining > 0:
             self.queue[:, :remaining] = keys[first_count:].t()
+            self.queue_sample_indices[:remaining] = (
+                sample_indices[first_count:])
 
         self.queue_ptr[0] = (ptr + count) % self.queue_size
         self.queue_filled[0] = min(
@@ -209,7 +230,8 @@ class OSEResA(nn.Module):
 
     def forward(self, view_a, view_b=None, exemplar=None,
                 momentum=0.996, ose_topk=8, ose_alpha=0.75,
-                ose_tau_s=0.04, ose_tau_t=0.1):
+                ose_tau_s=0.1, ose_tau_t=0.04,
+                sample_indices=None):
         if not self.pretrain:
             return self.encoder_q(view_a)
         if view_b is None or exemplar is None:
@@ -241,7 +263,7 @@ class OSEResA(nn.Module):
             assignment * assignment.clamp_min(1e-12).log()
         ).sum(dim=1).mean()
 
-        prototypes = self._class_prototypes(
+        prototypes, neighbor_sample_indices = self._class_prototypes(
             exemplar_z, topk=ose_topk, alpha=ose_alpha)
         student_logits = torch.matmul(
             online_z[1], prototypes.t()) / max(float(ose_tau_s), 1e-12)
@@ -264,7 +286,7 @@ class OSEResA(nn.Module):
         target_entropy = -(
             teacher_target * teacher_target.clamp_min(1e-12).log()
         ).sum(dim=1).mean()
-        self._dequeue_and_enqueue(teacher_z[0])
+        self._dequeue_and_enqueue(teacher_z[0], sample_indices)
 
         return {
             'cluster': cluster_loss,
@@ -276,4 +298,5 @@ class OSEResA(nn.Module):
             'target_entropy': target_entropy,
             'align_kl': align_loss - target_entropy,
             'queue_fill': self.queue_filled.float(),
+            'neighbor_sample_indices': neighbor_sample_indices,
         }

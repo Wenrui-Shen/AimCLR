@@ -98,12 +98,13 @@ class OSEResAProcessor(PT_Processor):
     @staticmethod
     def _parse_batch(batch):
         if len(batch) == 3:
-            data_pack, _, _ = batch
+            data_pack, label, index = batch
         elif len(batch) == 2:
-            data_pack, _ = batch
+            data_pack, label = batch
+            index = None
         else:
             raise ValueError('Unsupported ReSA batch format')
-        return data_pack
+        return data_pack, label, index
 
     def _prepare_stream(self, data):
         if self.arg.stream == 'joint':
@@ -168,10 +169,13 @@ class OSEResAProcessor(PT_Processor):
         self.model.train()
         loader = self.data_loader['train']
         loss_values = []
+        neighbor_correct = np.zeros(len(self.ose_class_ids), dtype=np.int64)
+        neighbor_total = np.zeros(len(self.ose_class_ids), dtype=np.int64)
+        dataset_labels = np.asarray(loader.dataset.label)
 
         for batch_index, batch in enumerate(loader):
             self.global_step += 1
-            data_pack = self._parse_batch(batch)
+            data_pack, _, sample_indices = self._parse_batch(batch)
             if len(data_pack) == 2:
                 weak_view_a, weak_view_b = data_pack
             elif len(data_pack) == 3:
@@ -183,6 +187,9 @@ class OSEResAProcessor(PT_Processor):
             weak_view_b = self._prepare_stream(
                 weak_view_b.float().to(self.dev, non_blocking=True))
             exemplar = self._exemplar_batch()
+            if sample_indices is not None:
+                sample_indices = sample_indices.long().to(
+                    self.dev, non_blocking=True)
 
             progress = self._training_progress(
                 epoch, batch_index, len(loader))
@@ -194,8 +201,32 @@ class OSEResAProcessor(PT_Processor):
                 momentum=momentum, ose_topk=self.arg.ose_topk,
                 ose_alpha=self.arg.ose_alpha,
                 ose_tau_s=self.arg.ose_tau_s,
-                ose_tau_t=self.arg.ose_tau_t)
+                ose_tau_t=self.arg.ose_tau_t,
+                sample_indices=sample_indices)
             loss = losses['cluster'] + self.arg.ose_lambda * losses['proto']
+
+            selected_indices = losses['neighbor_sample_indices'].detach()
+            selected_indices = selected_indices.cpu().numpy()
+            batch_purity = 0.0
+            if selected_indices.size > 0:
+                valid = np.logical_and(
+                    selected_indices >= 0,
+                    selected_indices < len(dataset_labels))
+                selected_labels = np.full(
+                    selected_indices.shape, -1, dtype=np.int64)
+                selected_labels[valid] = dataset_labels[
+                    selected_indices[valid]]
+                expected_labels = np.asarray(
+                    self.ose_class_ids, dtype=np.int64)[:, None]
+                correct = np.logical_and(
+                    selected_labels == expected_labels, valid)
+                batch_correct = correct.sum(axis=1)
+                batch_total = valid.sum(axis=1)
+                neighbor_correct += batch_correct
+                neighbor_total += batch_total
+                if batch_total.sum() > 0:
+                    batch_purity = float(
+                        batch_correct.sum()) / float(batch_total.sum())
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -211,6 +242,7 @@ class OSEResAProcessor(PT_Processor):
             self.iter_info['target_h'] = losses['target_entropy'].item()
             self.iter_info['align_kl'] = losses['align_kl'].item()
             self.iter_info['queue'] = int(losses['queue_fill'].item())
+            self.iter_info['nn_purity'] = '{:.4f}'.format(batch_purity)
             self.iter_info['ema_m'] = '{:.6f}'.format(momentum)
             self.iter_info['lr'] = '{:.6f}'.format(self.lr)
             loss_values.append(loss.item())
@@ -221,7 +253,30 @@ class OSEResAProcessor(PT_Processor):
         self.epoch_info['train_mean_loss'] = np.mean(loss_values)
         self.train_writer.add_scalar(
             'loss', self.epoch_info['train_mean_loss'], epoch)
+        total_neighbors = int(neighbor_total.sum())
+        epoch_purity = (float(neighbor_correct.sum()) / total_neighbors
+                        if total_neighbors > 0 else 0.0)
+        self.epoch_info['neighbor_purity'] = epoch_purity
+        self.train_writer.add_scalar('neighbor_purity', epoch_purity, epoch)
         self.show_epoch_info()
+        random_purity = 1.0 / max(len(self.ose_class_ids), 1)
+        self.io.print_log(
+            'OSE neighbor diagnostic | purity {:.4f} | random {:.4f}'.format(
+                epoch_purity, random_purity))
+        details = []
+        for class_index, class_id in enumerate(self.ose_class_ids):
+            if neighbor_total[class_index] > 0:
+                class_purity = (float(neighbor_correct[class_index]) /
+                                float(neighbor_total[class_index]))
+                correct_per_topk = self.arg.ose_topk * class_purity
+                details.append('{}:{:.2f}/{}'.format(
+                    class_id, correct_per_topk, self.arg.ose_topk))
+            else:
+                details.append('{}:n/a'.format(class_id))
+        for start in range(0, len(details), 10):
+            self.io.print_log(
+                'OSE neighbor per class | ' +
+                ' '.join(details[start:start + 10]))
 
     @staticmethod
     def get_parser(add_help=False):
@@ -239,7 +294,7 @@ class OSEResAProcessor(PT_Processor):
         parser.add_argument('--ose_exemplar_index_path', type=str, default='')
         parser.add_argument('--ose_topk', type=int, default=8)
         parser.add_argument('--ose_alpha', type=float, default=0.75)
-        parser.add_argument('--ose_tau_s', type=float, default=0.04)
-        parser.add_argument('--ose_tau_t', type=float, default=0.1)
+        parser.add_argument('--ose_tau_s', type=float, default=0.1)
+        parser.add_argument('--ose_tau_t', type=float, default=0.04)
         parser.add_argument('--ose_lambda', type=float, default=1.0)
         return parser
