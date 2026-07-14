@@ -35,8 +35,8 @@ model_args:
 # optimizer and ReSA schedule
 nesterov: False
 weight_decay: 1e-5
-base_lr: 0.1
-resa_final_lr: 0.0
+base_lr: 0.25
+resa_final_lr: 0.025
 resa_warmup_epoch: 2
 resa_momentum: 0.996
 optimizer: SGD
