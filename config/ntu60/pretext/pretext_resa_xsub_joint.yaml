@@ -1,4 +1,4 @@
-work_dir: ./data/ntu60_cs/ose_resa_weak_joint/pretext
+work_dir: ./data/ntu60_cs/resa_only_weak_joint/pretext
 
 # feeder
 train_feeder: feeder.ntu_feeder.Feeder_double
@@ -8,7 +8,7 @@ train_feeder_args:
   shear_amplitude: 0.5
   temperal_padding_ratio: 6
   mmap: True
-  return_index: True
+  return_index: False
 
 # model
 model: net.ose_resa.OSEResA
@@ -19,7 +19,6 @@ model_args:
   projector_hidden_dim: 2048
   projector_layers: 3
   use_predictor: True
-  queue_size: 8192
   cluster_temperature: 0.4
   sinkhorn_temperature: 0.05
   sinkhorn_iterations: 3
@@ -50,17 +49,8 @@ num_epoch: 300
 start_epoch: 0
 stream: 'joint'
 
-# one-shot exemplar prototype learning
-ose_enabled: True
-ose_num_class: 60
-ose_exemplar_seed: 0
-ose_exemplar_index_path: ./data/ntu60_cs/ose_resa_weak_joint/exemplar_seed0.npy
-ose_exclude_exemplars: True
-ose_topk: 8
-ose_alpha: 0.75
-ose_tau_s: 0.1
-ose_tau_t: 0.04
-ose_lambda: 1.0
+# disable every OSE data/model/loss path
+ose_enabled: False
 
 # log
 save_interval: 5

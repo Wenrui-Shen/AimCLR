@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torchlight import str2bool
 
 from .pretrain import PT_Processor
 
@@ -26,14 +27,22 @@ class OSEResAProcessor(PT_Processor):
     """ST-GCN pretraining with ReSA and the OSE prototype loss."""
 
     def load_model(self):
+        model_args = dict(self.arg.model_args)
+        model_args['ose_enabled'] = self.arg.ose_enabled
         self.model = self.io.load_model(
-            self.arg.model, **self.arg.model_args)
+            self.arg.model, **model_args)
         self.model.apply(_weights_init)
         self.model.reset_momentum_encoder()
+        mode = 'ReSA+Lproto' if self.arg.ose_enabled else 'ReSA-only'
+        self.io.print_log('Training mode | {} | OSE {}'.format(
+            mode, 'enabled' if self.arg.ose_enabled else 'disabled'))
 
     def load_data(self):
         super().load_data()
-        self._select_exemplars()
+        if self.arg.ose_enabled:
+            self._select_exemplars()
+            if self.arg.ose_exclude_exemplars:
+                self._exclude_exemplars_from_unlabeled_loader()
 
     def load_optimizer(self):
         parameters = [parameter for parameter in self.model.parameters()
@@ -55,6 +64,10 @@ class OSEResAProcessor(PT_Processor):
         dataset = self.data_loader['train'].dataset
         if not hasattr(dataset, 'label'):
             raise ValueError('ReSA+Lproto requires labels for exemplar selection')
+        if not getattr(dataset, 'return_index', False):
+            raise ValueError(
+                'OSE neighbor diagnostics require train_feeder_args.'
+                'return_index: True')
 
         labels = np.asarray(dataset.label)
         class_ids = sorted(np.unique(labels).tolist())
@@ -64,8 +77,42 @@ class OSEResAProcessor(PT_Processor):
         path = self.arg.ose_exemplar_index_path
         if path and os.path.isfile(path):
             payload = np.load(path, allow_pickle=True).item()
-            self.ose_class_ids = list(payload['class_ids'])
-            self.ose_exemplar_indices = list(payload['indices'])
+            cached_class_ids = np.asarray(payload['class_ids']).tolist()
+            cached_indices = np.asarray(
+                payload['indices'], dtype=np.int64).tolist()
+            cached_seed = payload.get('seed')
+            cached_num_samples = payload.get('num_samples')
+
+            errors = []
+            if cached_seed is None or int(cached_seed) != int(
+                    self.arg.ose_exemplar_seed):
+                errors.append('seed {} != {}'.format(
+                    cached_seed, self.arg.ose_exemplar_seed))
+            if cached_class_ids != class_ids:
+                errors.append('class IDs do not match the current dataset')
+            if len(cached_indices) != len(cached_class_ids):
+                errors.append('class and exemplar counts differ')
+            if (cached_num_samples is not None and
+                    int(cached_num_samples) != len(labels)):
+                errors.append('dataset size {} != {}'.format(
+                    cached_num_samples, len(labels)))
+            for class_id, index in zip(cached_class_ids, cached_indices):
+                if index < 0 or index >= len(labels):
+                    errors.append('index {} is out of range'.format(index))
+                    break
+                if labels[index] != class_id:
+                    errors.append(
+                        'index {} has label {}, expected {}'.format(
+                            index, labels[index], class_id))
+                    break
+            if errors:
+                raise ValueError(
+                    'Invalid OSE exemplar cache {}: {}. Use a cache path '
+                    'specific to the seed and dataset.'.format(
+                        path, '; '.join(errors)))
+
+            self.ose_class_ids = cached_class_ids
+            self.ose_exemplar_indices = cached_indices
         else:
             rng = np.random.RandomState(self.arg.ose_exemplar_seed)
             indices = []
@@ -85,6 +132,7 @@ class OSEResAProcessor(PT_Processor):
                     'class_ids': np.asarray(class_ids),
                     'indices': np.asarray(indices, dtype=np.int64),
                     'seed': int(self.arg.ose_exemplar_seed),
+                    'num_samples': len(labels),
                 })
 
         preview = ', '.join(
@@ -94,6 +142,31 @@ class OSEResAProcessor(PT_Processor):
         self.io.print_log(
             'OSE exemplars | classes {} | seed {} | {}'.format(
                 len(self.ose_class_ids), self.arg.ose_exemplar_seed, preview))
+
+    def _exclude_exemplars_from_unlabeled_loader(self):
+        loader = self.data_loader['train']
+        dataset = loader.dataset
+        excluded = set(self.ose_exemplar_indices)
+        unlabeled_indices = [
+            index for index in range(len(dataset)) if index not in excluded]
+        if len(unlabeled_indices) < loader.batch_size:
+            raise ValueError(
+                'Not enough unlabeled samples after excluding OSE exemplars')
+
+        sampler = torch.utils.data.SubsetRandomSampler(unlabeled_indices)
+        self.data_loader['train'] = torch.utils.data.DataLoader(
+            dataset=dataset,
+            batch_size=loader.batch_size,
+            sampler=sampler,
+            num_workers=loader.num_workers,
+            collate_fn=loader.collate_fn,
+            pin_memory=loader.pin_memory,
+            drop_last=loader.drop_last,
+            timeout=loader.timeout,
+            worker_init_fn=loader.worker_init_fn)
+        self.io.print_log(
+            'OSE unlabeled split | {} samples | excluded {} exemplars'.format(
+                len(unlabeled_indices), len(excluded)))
 
     @staticmethod
     def _parse_batch(batch):
@@ -169,9 +242,12 @@ class OSEResAProcessor(PT_Processor):
         self.model.train()
         loader = self.data_loader['train']
         loss_values = []
-        neighbor_correct = np.zeros(len(self.ose_class_ids), dtype=np.int64)
-        neighbor_total = np.zeros(len(self.ose_class_ids), dtype=np.int64)
-        dataset_labels = np.asarray(loader.dataset.label)
+        if self.arg.ose_enabled:
+            neighbor_correct = np.zeros(
+                len(self.ose_class_ids), dtype=np.int64)
+            neighbor_total = np.zeros(
+                len(self.ose_class_ids), dtype=np.int64)
+            dataset_labels = np.asarray(loader.dataset.label)
 
         for batch_index, batch in enumerate(loader):
             self.global_step += 1
@@ -186,8 +262,7 @@ class OSEResAProcessor(PT_Processor):
                 weak_view_a.float().to(self.dev, non_blocking=True))
             weak_view_b = self._prepare_stream(
                 weak_view_b.float().to(self.dev, non_blocking=True))
-            exemplar = self._exemplar_batch()
-            if sample_indices is not None:
+            if self.arg.ose_enabled and sample_indices is not None:
                 sample_indices = sample_indices.long().to(
                     self.dev, non_blocking=True)
 
@@ -196,37 +271,44 @@ class OSEResAProcessor(PT_Processor):
             self._set_learning_rate(progress)
             momentum = self._momentum(progress)
 
-            losses = self.model(
-                weak_view_a, weak_view_b, exemplar,
-                momentum=momentum, ose_topk=self.arg.ose_topk,
-                ose_alpha=self.arg.ose_alpha,
-                ose_tau_s=self.arg.ose_tau_s,
-                ose_tau_t=self.arg.ose_tau_t,
-                sample_indices=sample_indices)
-            loss = losses['cluster'] + self.arg.ose_lambda * losses['proto']
+            if self.arg.ose_enabled:
+                exemplar = self._exemplar_batch()
+                losses = self.model(
+                    weak_view_a, weak_view_b, exemplar,
+                    momentum=momentum, ose_topk=self.arg.ose_topk,
+                    ose_alpha=self.arg.ose_alpha,
+                    ose_tau_s=self.arg.ose_tau_s,
+                    ose_tau_t=self.arg.ose_tau_t,
+                    sample_indices=sample_indices)
+                loss = (losses['cluster'] +
+                        self.arg.ose_lambda * losses['proto'])
 
-            selected_indices = losses['neighbor_sample_indices'].detach()
-            selected_indices = selected_indices.cpu().numpy()
-            batch_purity = 0.0
-            if selected_indices.size > 0:
-                valid = np.logical_and(
-                    selected_indices >= 0,
-                    selected_indices < len(dataset_labels))
-                selected_labels = np.full(
-                    selected_indices.shape, -1, dtype=np.int64)
-                selected_labels[valid] = dataset_labels[
-                    selected_indices[valid]]
-                expected_labels = np.asarray(
-                    self.ose_class_ids, dtype=np.int64)[:, None]
-                correct = np.logical_and(
-                    selected_labels == expected_labels, valid)
-                batch_correct = correct.sum(axis=1)
-                batch_total = valid.sum(axis=1)
-                neighbor_correct += batch_correct
-                neighbor_total += batch_total
-                if batch_total.sum() > 0:
-                    batch_purity = float(
-                        batch_correct.sum()) / float(batch_total.sum())
+                selected_indices = losses[
+                    'neighbor_sample_indices'].detach().cpu().numpy()
+                batch_purity = 0.0
+                if selected_indices.size > 0:
+                    valid = np.logical_and(
+                        selected_indices >= 0,
+                        selected_indices < len(dataset_labels))
+                    selected_labels = np.full(
+                        selected_indices.shape, -1, dtype=np.int64)
+                    selected_labels[valid] = dataset_labels[
+                        selected_indices[valid]]
+                    expected_labels = np.asarray(
+                        self.ose_class_ids, dtype=np.int64)[:, None]
+                    correct = np.logical_and(
+                        selected_labels == expected_labels, valid)
+                    batch_correct = correct.sum(axis=1)
+                    batch_total = valid.sum(axis=1)
+                    neighbor_correct += batch_correct
+                    neighbor_total += batch_total
+                    if batch_total.sum() > 0:
+                        batch_purity = float(
+                            batch_correct.sum()) / float(batch_total.sum())
+            else:
+                losses = self.model(
+                    weak_view_a, weak_view_b, momentum=momentum)
+                loss = losses['cluster']
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -236,13 +318,14 @@ class OSEResAProcessor(PT_Processor):
             self.iter_info['cluster'] = losses['cluster'].item()
             self.iter_info['cluster_h'] = losses['cluster_entropy'].item()
             self.iter_info['cluster_kl'] = losses['cluster_kl'].item()
-            self.iter_info['proto'] = losses['proto'].item()
-            self.iter_info['align'] = losses['align'].item()
-            self.iter_info['disp'] = losses['disp'].item()
-            self.iter_info['target_h'] = losses['target_entropy'].item()
-            self.iter_info['align_kl'] = losses['align_kl'].item()
-            self.iter_info['queue'] = int(losses['queue_fill'].item())
-            self.iter_info['nn_purity'] = '{:.4f}'.format(batch_purity)
+            if self.arg.ose_enabled:
+                self.iter_info['proto'] = losses['proto'].item()
+                self.iter_info['align'] = losses['align'].item()
+                self.iter_info['disp'] = losses['disp'].item()
+                self.iter_info['target_h'] = losses['target_entropy'].item()
+                self.iter_info['align_kl'] = losses['align_kl'].item()
+                self.iter_info['queue'] = int(losses['queue_fill'].item())
+                self.iter_info['nn_purity'] = '{:.4f}'.format(batch_purity)
             self.iter_info['ema_m'] = '{:.6f}'.format(momentum)
             self.iter_info['lr'] = '{:.6f}'.format(self.lr)
             loss_values.append(loss.item())
@@ -253,6 +336,10 @@ class OSEResAProcessor(PT_Processor):
         self.epoch_info['train_mean_loss'] = np.mean(loss_values)
         self.train_writer.add_scalar(
             'loss', self.epoch_info['train_mean_loss'], epoch)
+        if not self.arg.ose_enabled:
+            self.show_epoch_info()
+            return
+
         total_neighbors = int(neighbor_total.sum())
         epoch_purity = (float(neighbor_correct.sum()) / total_neighbors
                         if total_neighbors > 0 else 0.0)
@@ -289,9 +376,12 @@ class OSEResAProcessor(PT_Processor):
         parser.add_argument('--resa_momentum', type=float, default=0.996)
         parser.add_argument('--resa_warmup_epoch', type=int, default=2)
         parser.add_argument('--resa_final_lr', type=float, default=0.0)
+        parser.add_argument('--ose_enabled', type=str2bool, default=True)
         parser.add_argument('--ose_num_class', type=int, default=0)
         parser.add_argument('--ose_exemplar_seed', type=int, default=0)
         parser.add_argument('--ose_exemplar_index_path', type=str, default='')
+        parser.add_argument('--ose_exclude_exemplars', type=str2bool,
+                            default=True)
         parser.add_argument('--ose_topk', type=int, default=8)
         parser.add_argument('--ose_alpha', type=float, default=0.75)
         parser.add_argument('--ose_tau_s', type=float, default=0.1)

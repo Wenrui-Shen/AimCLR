@@ -39,7 +39,7 @@ class OSEResA(nn.Module):
 
     def __init__(self, base_encoder=None, pretrain=True, feature_dim=256,
                  projector_hidden_dim=2048, projector_layers=3,
-                 use_predictor=True, queue_size=8192,
+                 use_predictor=True, ose_enabled=True, queue_size=8192,
                  cluster_temperature=0.4, sinkhorn_temperature=0.05,
                  sinkhorn_iterations=3, in_channels=3, hidden_channels=16,
                  hidden_dim=256, num_class=60, dropout=0.5,
@@ -48,6 +48,7 @@ class OSEResA(nn.Module):
         super().__init__()
         base_encoder = import_class(base_encoder)
         self.pretrain = pretrain
+        self.ose_enabled = bool(ose_enabled)
 
         self.encoder_q = base_encoder(
             in_channels=in_channels, hidden_channels=hidden_channels,
@@ -73,14 +74,15 @@ class OSEResA(nn.Module):
         self.cluster_temperature = float(cluster_temperature)
         self.sinkhorn_temperature = float(sinkhorn_temperature)
         self.sinkhorn_iterations = int(sinkhorn_iterations)
-        self.queue_size = int(queue_size)
-
-        self.register_buffer('queue', torch.zeros(feature_dim, queue_size))
-        self.register_buffer('queue_ptr', torch.zeros(1, dtype=torch.long))
-        self.register_buffer('queue_filled', torch.zeros(1, dtype=torch.long))
-        self.register_buffer(
-            'queue_sample_indices',
-            torch.full((queue_size,), -1, dtype=torch.long))
+        if self.ose_enabled:
+            self.queue_size = int(queue_size)
+            self.register_buffer('queue', torch.zeros(feature_dim, queue_size))
+            self.register_buffer('queue_ptr', torch.zeros(1, dtype=torch.long))
+            self.register_buffer(
+                'queue_filled', torch.zeros(1, dtype=torch.long))
+            self.register_buffer(
+                'queue_sample_indices',
+                torch.full((queue_size,), -1, dtype=torch.long))
         self.reset_momentum_encoder()
 
     @torch.no_grad()
@@ -199,22 +201,24 @@ class OSEResA(nn.Module):
         self.queue_filled[0] = min(
             self.queue_size, int(self.queue_filled.item()) + count)
 
-    def _online_embeddings(self, view_a, view_b, exemplar):
+    def _online_embeddings(self, view_a, view_b):
         view_a_features = self.encoder_q.forward_features(view_a)
         view_b_features = self.encoder_q.forward_features(view_b)
-        exemplar_features = self.encoder_q.forward_features(exemplar)
 
         view_a_embedding = F.normalize(
             self.predictor(self.projector_q(view_a_features)), dim=1)
         view_b_embedding = F.normalize(
             self.predictor(self.projector_q(view_b_features)), dim=1)
-        exemplar_embedding = F.normalize(
-            self.predictor(self.projector_q(exemplar_features)), dim=1)
 
         features = [F.normalize(view_a_features, dim=1),
                     F.normalize(view_b_features, dim=1)]
         embeddings = [view_a_embedding, view_b_embedding]
-        return features, embeddings, exemplar_embedding
+        return features, embeddings
+
+    def _exemplar_embedding(self, exemplar):
+        exemplar_features = self.encoder_q.forward_features(exemplar)
+        return F.normalize(
+            self.predictor(self.projector_q(exemplar_features)), dim=1)
 
     @torch.no_grad()
     def _teacher_embeddings(self, view_a, view_b):
@@ -234,11 +238,14 @@ class OSEResA(nn.Module):
                 sample_indices=None):
         if not self.pretrain:
             return self.encoder_q(view_a)
-        if view_b is None or exemplar is None:
-            raise ValueError('ReSA+Lproto requires two views and exemplar inputs')
+        if view_b is None:
+            raise ValueError('ReSA requires two view inputs')
 
-        online_h, online_z, exemplar_z = self._online_embeddings(
-            view_a, view_b, exemplar)
+        online_h, online_z = self._online_embeddings(view_a, view_b)
+        if self.ose_enabled:
+            if exemplar is None:
+                raise ValueError('ReSA+Lproto requires exemplar inputs')
+            exemplar_z = self._exemplar_embedding(exemplar)
         with torch.no_grad():
             self._momentum_update(momentum)
             teacher_h, teacher_z = self._teacher_embeddings(
@@ -262,6 +269,14 @@ class OSEResA(nn.Module):
         cluster_entropy = -(
             assignment * assignment.clamp_min(1e-12).log()
         ).sum(dim=1).mean()
+
+        result = {
+            'cluster': cluster_loss,
+            'cluster_entropy': cluster_entropy,
+            'cluster_kl': cluster_loss - cluster_entropy,
+        }
+        if not self.ose_enabled:
+            return result
 
         prototypes, neighbor_sample_indices = self._class_prototypes(
             exemplar_z, topk=ose_topk, alpha=ose_alpha)
@@ -288,10 +303,7 @@ class OSEResA(nn.Module):
         ).sum(dim=1).mean()
         self._dequeue_and_enqueue(teacher_z[0], sample_indices)
 
-        return {
-            'cluster': cluster_loss,
-            'cluster_entropy': cluster_entropy,
-            'cluster_kl': cluster_loss - cluster_entropy,
+        result.update({
             'proto': proto_loss,
             'align': align_loss,
             'disp': disp_loss,
@@ -299,4 +311,5 @@ class OSEResA(nn.Module):
             'align_kl': align_loss - target_entropy,
             'queue_fill': self.queue_filled.float(),
             'neighbor_sample_indices': neighbor_sample_indices,
-        }
+        })
+        return result
