@@ -253,15 +253,15 @@ class OSEResAProcessor(PT_Processor):
             self.global_step += 1
             data_pack, _, sample_indices = self._parse_batch(batch)
             if len(data_pack) == 2:
-                weak_view_a, weak_view_b = data_pack
+                view_a, view_b = data_pack
             elif len(data_pack) == 3:
-                _, weak_view_a, weak_view_b = data_pack
+                _, view_a, view_b = data_pack
             else:
-                raise ValueError('ReSA requires exactly two weak views')
-            weak_view_a = self._prepare_stream(
-                weak_view_a.float().to(self.dev, non_blocking=True))
-            weak_view_b = self._prepare_stream(
-                weak_view_b.float().to(self.dev, non_blocking=True))
+                raise ValueError('ReSA requires exactly two training views')
+            view_a = self._prepare_stream(
+                view_a.float().to(self.dev, non_blocking=True))
+            view_b = self._prepare_stream(
+                view_b.float().to(self.dev, non_blocking=True))
             if self.arg.ose_enabled and sample_indices is not None:
                 sample_indices = sample_indices.long().to(
                     self.dev, non_blocking=True)
@@ -274,7 +274,7 @@ class OSEResAProcessor(PT_Processor):
             if self.arg.ose_enabled:
                 exemplar = self._exemplar_batch()
                 losses = self.model(
-                    weak_view_a, weak_view_b, exemplar,
+                    view_a, view_b, exemplar,
                     momentum=momentum, ose_topk=self.arg.ose_topk,
                     ose_alpha=self.arg.ose_alpha,
                     ose_tau_s=self.arg.ose_tau_s,
@@ -307,7 +307,7 @@ class OSEResAProcessor(PT_Processor):
                             batch_correct.sum()) / float(batch_total.sum())
             else:
                 losses = self.model(
-                    weak_view_a, weak_view_b, momentum=momentum)
+                    view_a, view_b, momentum=momentum)
                 loss = losses['cluster']
 
             self.optimizer.zero_grad()

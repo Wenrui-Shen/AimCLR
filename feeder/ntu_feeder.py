@@ -125,13 +125,29 @@ class Feeder_triple(torch.utils.data.Dataset):
 
 
 class Feeder_double(Feeder_triple):
-    """Feeder for two independently weak-augmented views."""
+    """Feeder for two views with a configurable second-view strength."""
+
+    def __init__(self, *args, second_view='weak', **kwargs):
+        super().__init__(*args, **kwargs)
+        if second_view not in ('weak', 'standard'):
+            raise ValueError(
+                "second_view must be either 'weak' or 'standard', got {}"
+                .format(second_view))
+        self.second_view = second_view
+
+    def _standard_aug(self, data_numpy):
+        """Weak augmentation followed by the ReSA standard-view rotation."""
+        data_numpy = self._aug(data_numpy)
+        return tools.random_rotate(data_numpy)
 
     def __getitem__(self, index):
         data_numpy = np.array(self.data[index])
         label = self.label[index]
         data1 = self._aug(data_numpy)
-        data2 = self._aug(data_numpy)
+        if self.second_view == 'standard':
+            data2 = self._standard_aug(data_numpy)
+        else:
+            data2 = self._aug(data_numpy)
         if self.return_index:
             return [data1, data2], label, index
         return [data1, data2], label

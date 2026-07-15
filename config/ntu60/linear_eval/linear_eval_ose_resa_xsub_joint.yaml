@@ -1,6 +1,6 @@
-work_dir: ./data/ntu60_cs/ose_resa_weak_joint/linear_eval
+work_dir: ./data/ntu60_cs/ose_resa_weak_standard_rot_joint/linear_eval
 
-weights: ./data/ntu60_cs/ose_resa_weak_joint/pretext/epoch300_model.pt
+weights: ./data/ntu60_cs/ose_resa_weak_standard_rot_joint/pretext/epoch300_model.pt
 ignore_weights: [encoder_q.fc, encoder_k, projector_q, projector_k, predictor, queue]
 
 # feeder
@@ -45,7 +45,7 @@ step: [80]
 device: [0]
 batch_size: 128
 test_batch_size: 128
-num_epoch: 100
+num_epoch: 200
 stream: 'joint'
 
 # log
