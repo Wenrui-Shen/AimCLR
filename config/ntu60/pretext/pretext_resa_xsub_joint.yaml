@@ -1,4 +1,4 @@
-work_dir: ./data/ntu60_cs/resa_only_weak_standard_rot_joint/pretext
+work_dir: ./data/ntu60_cs/resa_only_weak_dropout0_joint/pretext
 
 # feeder
 train_feeder: feeder.ntu_feeder.Feeder_double
@@ -7,7 +7,7 @@ train_feeder_args:
   label_path: ../data/pstl/xsub/train_label.pkl
   shear_amplitude: 0.5
   temperal_padding_ratio: 6
-  second_view: standard
+  second_view: weak
   mmap: True
   return_index: False
 

@@ -205,20 +205,23 @@ class OSEResA(nn.Module):
         view_a_features = self.encoder_q.forward_features(view_a)
         view_b_features = self.encoder_q.forward_features(view_b)
 
-        view_a_embedding = F.normalize(
-            self.predictor(self.projector_q(view_a_features)), dim=1)
-        view_b_embedding = F.normalize(
-            self.predictor(self.projector_q(view_b_features)), dim=1)
+        view_a_projected = self.projector_q(view_a_features)
+        view_b_projected = self.projector_q(view_b_features)
+        view_a_prediction = F.normalize(
+            self.predictor(view_a_projected), dim=1)
+        view_b_prediction = F.normalize(
+            self.predictor(view_b_projected), dim=1)
 
         features = [F.normalize(view_a_features, dim=1),
                     F.normalize(view_b_features, dim=1)]
-        embeddings = [view_a_embedding, view_b_embedding]
-        return features, embeddings
+        projections = [F.normalize(view_a_projected, dim=1),
+                       F.normalize(view_b_projected, dim=1)]
+        predictions = [view_a_prediction, view_b_prediction]
+        return features, projections, predictions
 
     def _exemplar_embedding(self, exemplar):
         exemplar_features = self.encoder_q.forward_features(exemplar)
-        return F.normalize(
-            self.predictor(self.projector_q(exemplar_features)), dim=1)
+        return F.normalize(self.projector_q(exemplar_features), dim=1)
 
     @torch.no_grad()
     def _teacher_embeddings(self, view_a, view_b):
@@ -241,7 +244,7 @@ class OSEResA(nn.Module):
         if view_b is None:
             raise ValueError('ReSA requires two view inputs')
 
-        online_h, online_z = self._online_embeddings(view_a, view_b)
+        online_h, online_z, online_q = self._online_embeddings(view_a, view_b)
         if self.ose_enabled:
             if exemplar is None:
                 raise ValueError('ReSA+Lproto requires exemplar inputs')
@@ -253,14 +256,14 @@ class OSEResA(nn.Module):
 
         assignment = self._sinkhorn_knopp(
             torch.matmul(online_h[0].detach(), teacher_h[0].t()))
-        cluster_loss = online_z[0].new_tensor(0.0)
+        cluster_loss = online_q[0].new_tensor(0.0)
         terms = 0
-        for online_index in range(len(online_z)):
+        for online_index in range(len(online_q)):
             for teacher_index in range(len(teacher_z)):
                 if online_index == teacher_index:
                     continue
                 logits = torch.matmul(
-                    online_z[online_index], teacher_z[teacher_index].t())
+                    online_q[online_index], teacher_z[teacher_index].t())
                 logits = logits / max(self.cluster_temperature, 1e-12)
                 cluster_loss = cluster_loss + self._soft_cross_entropy(
                     logits, assignment)
