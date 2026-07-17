@@ -35,7 +35,7 @@ def _build_predictor(input_dim, hidden_dim):
 
 
 class OSEResA(nn.Module):
-    """ReSA with the exemplar-guided prototype loss from OSESSL."""
+    """ReSA with exemplar-guided prototype and interpolation losses."""
 
     def __init__(self, base_encoder=None, pretrain=True, feature_dim=256,
                  projector_hidden_dim=2048, projector_layers=3,
@@ -220,8 +220,11 @@ class OSEResA(nn.Module):
         return features, projections, predictions
 
     def _exemplar_embedding(self, exemplar):
-        exemplar_features = self.encoder_q.forward_features(exemplar)
-        return F.normalize(self.projector_q(exemplar_features), dim=1)
+        return self._online_projection(exemplar)
+
+    def _online_projection(self, view):
+        features = self.encoder_q.forward_features(view)
+        return F.normalize(self.projector_q(features), dim=1)
 
     @torch.no_grad()
     def _teacher_embeddings(self, view_a, view_b):
@@ -238,11 +241,26 @@ class OSEResA(nn.Module):
     def forward(self, view_a, view_b=None, exemplar=None,
                 momentum=0.996, ose_topk=8, ose_alpha=0.75,
                 ose_tau_s=0.1, ose_tau_t=0.04,
-                sample_indices=None):
+                sample_indices=None, mixed_view=None, mix_index=None,
+                mix_beta=None, compute_mix_proto=False,
+                compute_mix_ins=False):
         if not self.pretrain:
             return self.encoder_q(view_a)
         if view_b is None:
             raise ValueError('ReSA requires two view inputs')
+        compute_mix_proto = bool(compute_mix_proto)
+        compute_mix_ins = bool(compute_mix_ins)
+        compute_mix = compute_mix_proto or compute_mix_ins
+        if compute_mix and not self.ose_enabled:
+            raise ValueError('Lmix requires OSE to be enabled')
+        if compute_mix:
+            if mixed_view is None or mix_index is None or mix_beta is None:
+                raise ValueError(
+                    'Lmix requires mixed_view, mix_index, and mix_beta')
+        elif any(value is not None for value in (
+                mixed_view, mix_index, mix_beta)):
+            raise ValueError(
+                'Mixed inputs were provided while both Lmix terms are disabled')
 
         online_h, online_z, online_q = self._online_embeddings(view_a, view_b)
         if self.ose_enabled:
@@ -301,6 +319,52 @@ class OSEResA(nn.Module):
             disp_loss = prototype_similarity.new_tensor(0.0)
         proto_loss = align_loss + disp_loss
 
+        mix_proto_loss = proto_loss.new_tensor(0.0)
+        mix_ins_loss = proto_loss.new_tensor(0.0)
+        if compute_mix:
+            if mixed_view.size(0) != online_z[1].size(0):
+                raise ValueError(
+                    'Mixed view batch size must match the unlabeled views')
+            mix_index = mix_index.detach().to(
+                device=online_z[1].device, dtype=torch.long).view(-1)
+            if mix_index.numel() != online_z[1].size(0):
+                raise ValueError(
+                    'Mix permutation size must match the batch size')
+            if (mix_index.min().item() < 0 or
+                    mix_index.max().item() >= online_z[1].size(0)):
+                raise ValueError('Mix permutation contains invalid indices')
+            mix_beta = float(mix_beta)
+            if not 0.0 <= mix_beta <= 1.0:
+                raise ValueError('Mix coefficient must be in [0, 1]')
+
+            # The mixed branch remains in encoder-projector space. It does not
+            # use the ReSA predictor, participate in Sinkhorn, or enter the queue.
+            mixed_z = self._online_projection(mixed_view)
+            if compute_mix_proto:
+                mixed_logits = torch.matmul(
+                    mixed_z, prototypes.t()) / max(
+                        float(ose_tau_s), 1e-12)
+                student_target = torch.softmax(
+                    student_logits, dim=1).detach()
+                mixed_target = (
+                    mix_beta * student_target +
+                    (1.0 - mix_beta) * teacher_target[mix_index])
+                mix_proto_loss = self._soft_cross_entropy(
+                    mixed_logits, mixed_target)
+
+            if compute_mix_ins:
+                instance_logits = torch.matmul(
+                    mixed_z, teacher_z[0].detach().t()) / max(
+                        float(ose_tau_s), 1e-12)
+                instance_log_prob = F.log_softmax(instance_logits, dim=1)
+                row = torch.arange(
+                    mixed_z.size(0), device=mixed_z.device)
+                mix_ins_loss = -(
+                    mix_beta * instance_log_prob[row, row] +
+                    (1.0 - mix_beta) *
+                    instance_log_prob[row, mix_index]
+                ).mean()
+
         target_entropy = -(
             teacher_target * teacher_target.clamp_min(1e-12).log()
         ).sum(dim=1).mean()
@@ -310,6 +374,9 @@ class OSEResA(nn.Module):
             'proto': proto_loss,
             'align': align_loss,
             'disp': disp_loss,
+            'mix': mix_proto_loss + mix_ins_loss,
+            'mix_proto': mix_proto_loss,
+            'mix_ins': mix_ins_loss,
             'target_entropy': target_entropy,
             'align_kl': align_loss - target_entropy,
             'queue_fill': self.queue_filled.float(),

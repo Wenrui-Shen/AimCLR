@@ -24,18 +24,42 @@ def _weights_init(module):
 
 
 class OSEResAProcessor(PT_Processor):
-    """ST-GCN pretraining with ReSA and the OSE prototype loss."""
+    """ST-GCN pretraining with ReSA and the OSE losses."""
 
     def load_model(self):
+        if self.arg.ose_mix_proto_weight < 0:
+            raise ValueError('ose_mix_proto_weight must be non-negative')
+        if self.arg.ose_mix_ins_weight < 0:
+            raise ValueError('ose_mix_ins_weight must be non-negative')
+        mix_enabled = (
+            self.arg.ose_mix_proto_weight > 0 or
+            self.arg.ose_mix_ins_weight > 0)
+        if mix_enabled and not self.arg.ose_enabled:
+            raise ValueError('Lmix cannot be enabled when OSE is disabled')
+        if mix_enabled and self.arg.ose_mix_alpha <= 0:
+            raise ValueError('ose_mix_alpha must be positive')
+
         model_args = dict(self.arg.model_args)
         model_args['ose_enabled'] = self.arg.ose_enabled
         self.model = self.io.load_model(
             self.arg.model, **model_args)
         self.model.apply(_weights_init)
         self.model.reset_momentum_encoder()
-        mode = 'ReSA+Lproto' if self.arg.ose_enabled else 'ReSA-only'
+        if not self.arg.ose_enabled:
+            mode = 'ReSA-only'
+        elif mix_enabled:
+            mode = 'ReSA+Lproto+Lmix'
+        else:
+            mode = 'ReSA+Lproto'
         self.io.print_log('Training mode | {} | OSE {}'.format(
             mode, 'enabled' if self.arg.ose_enabled else 'disabled'))
+        if self.arg.ose_enabled:
+            self.io.print_log(
+                'OSE mix | proto_weight {:.4f} | ins_weight {:.4f} | '
+                'beta_alpha {:.4f}'.format(
+                    self.arg.ose_mix_proto_weight,
+                    self.arg.ose_mix_ins_weight,
+                    self.arg.ose_mix_alpha))
 
     def load_data(self):
         super().load_data()
@@ -266,6 +290,27 @@ class OSEResAProcessor(PT_Processor):
                 sample_indices = sample_indices.long().to(
                     self.dev, non_blocking=True)
 
+            compute_mix_proto = (
+                self.arg.ose_enabled and
+                self.arg.ose_mix_proto_weight > 0)
+            compute_mix_ins = (
+                self.arg.ose_enabled and
+                self.arg.ose_mix_ins_weight > 0)
+            compute_mix = compute_mix_proto or compute_mix_ins
+            mixed_view = None
+            mix_index = None
+            mix_beta = None
+            if compute_mix:
+                mix_index = torch.randperm(
+                    view_a.size(0), device=view_a.device)
+                mix_beta = float(np.random.beta(
+                    self.arg.ose_mix_alpha, self.arg.ose_mix_alpha))
+                # Eq. (10): x is the online Lproto view (view_b), while
+                # x' is the shuffled teacher Lproto view (view_a).
+                mixed_view = (
+                    mix_beta * view_b +
+                    (1.0 - mix_beta) * view_a[mix_index])
+
             progress = self._training_progress(
                 epoch, batch_index, len(loader))
             self._set_learning_rate(progress)
@@ -279,9 +324,22 @@ class OSEResAProcessor(PT_Processor):
                     ose_alpha=self.arg.ose_alpha,
                     ose_tau_s=self.arg.ose_tau_s,
                     ose_tau_t=self.arg.ose_tau_t,
-                    sample_indices=sample_indices)
+                    sample_indices=sample_indices,
+                    mixed_view=mixed_view,
+                    mix_index=mix_index,
+                    mix_beta=mix_beta,
+                    compute_mix_proto=compute_mix_proto,
+                    compute_mix_ins=compute_mix_ins)
                 loss = (losses['cluster'] +
                         self.arg.ose_lambda * losses['proto'])
+                if compute_mix_proto:
+                    loss = (
+                        loss + self.arg.ose_mix_proto_weight *
+                        losses['mix_proto'])
+                if compute_mix_ins:
+                    loss = (
+                        loss + self.arg.ose_mix_ins_weight *
+                        losses['mix_ins'])
 
                 selected_indices = losses[
                     'neighbor_sample_indices'].detach().cpu().numpy()
@@ -322,6 +380,9 @@ class OSEResAProcessor(PT_Processor):
                 self.iter_info['proto'] = losses['proto'].item()
                 self.iter_info['align'] = losses['align'].item()
                 self.iter_info['disp'] = losses['disp'].item()
+                self.iter_info['mix'] = losses['mix'].item()
+                self.iter_info['mix_p'] = losses['mix_proto'].item()
+                self.iter_info['mix_i'] = losses['mix_ins'].item()
                 self.iter_info['target_h'] = losses['target_entropy'].item()
                 self.iter_info['align_kl'] = losses['align_kl'].item()
                 self.iter_info['queue'] = int(losses['queue_fill'].item())
@@ -387,4 +448,7 @@ class OSEResAProcessor(PT_Processor):
         parser.add_argument('--ose_tau_s', type=float, default=0.1)
         parser.add_argument('--ose_tau_t', type=float, default=0.04)
         parser.add_argument('--ose_lambda', type=float, default=1.0)
+        parser.add_argument('--ose_mix_proto_weight', type=float, default=0.0)
+        parser.add_argument('--ose_mix_ins_weight', type=float, default=0.0)
+        parser.add_argument('--ose_mix_alpha', type=float, default=1.0)
         return parser
