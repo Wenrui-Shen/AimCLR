@@ -43,6 +43,37 @@ class CTRGCNTest(unittest.TestCase):
         self.assertEqual(model.fc.in_features, 256)
         self.assertEqual(len(model.layers), 10)
 
+    def test_shallow_depth_profiles_keep_output_dimension(self):
+        expected_channels = {
+            3: [8, 16, 32],
+            8: [8, 8, 8, 8, 16, 16, 16, 32],
+        }
+        for num_layers, channels in expected_channels.items():
+            with self.subTest(num_layers=num_layers):
+                model = Model(
+                    hidden_channels=8,
+                    hidden_dim=32,
+                    num_layers=num_layers,
+                    graph_args={
+                        'layout': 'ntu-rgb+d',
+                        'strategy': 'spatial',
+                    })
+                actual_channels = [
+                    layer.gcn.bn.num_features for layer in model.layers]
+                self.assertEqual(actual_channels, channels)
+                self.assertEqual(model.fc.in_features, 32)
+
+    def test_rejects_undefined_depth_profile(self):
+        with self.assertRaisesRegex(ValueError, 'num_layers'):
+            Model(
+                hidden_channels=8,
+                hidden_dim=32,
+                num_layers=7,
+                graph_args={
+                    'layout': 'ntu-rgb+d',
+                    'strategy': 'spatial',
+                })
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -28,6 +28,19 @@ _INWARD_ORIGINAL = [
 _INWARD = [(source - 1, target - 1)
            for source, target in _INWARD_ORIGINAL]
 _OUTWARD = [(target, source) for source, target in _INWARD]
+_DEPTH_PROFILES = {
+    # (output-width multiplier, temporal stride)
+    3: ((1, 1), (2, 2), (4, 2)),
+    8: (
+        (1, 1), (1, 1), (1, 1), (1, 1),
+        (2, 2), (2, 1), (2, 1), (4, 2),
+    ),
+    10: (
+        (1, 1), (1, 1), (1, 1), (1, 1),
+        (2, 2), (2, 1), (2, 1),
+        (4, 2), (4, 1), (4, 1),
+    ),
+}
 
 
 def _edge_to_matrix(edges, num_point):
@@ -298,7 +311,8 @@ class Model(nn.Module):
     def __init__(self, in_channels=3, hidden_channels=64,
                  hidden_dim=256, num_class=60, dropout=0.0,
                  graph_args=None, edge_importance_weighting=True,
-                 num_point=25, num_person=2, adaptive=True, **kwargs):
+                 num_point=25, num_person=2, adaptive=True,
+                 num_layers=10, **kwargs):
         super().__init__()
         del edge_importance_weighting, kwargs
         graph_args = graph_args or {}
@@ -316,48 +330,36 @@ class Model(nn.Module):
         if int(hidden_dim) != int(hidden_channels) * 4:
             raise ValueError(
                 'CTR-GCN hidden_dim must equal 4 * hidden_channels')
+        num_layers = int(num_layers)
+        if num_layers not in _DEPTH_PROFILES:
+            raise ValueError(
+                'CTR-GCN num_layers must be one of {}, received {}'
+                .format(sorted(_DEPTH_PROFILES), num_layers))
 
         self.num_point = int(num_point)
         self.num_person = int(num_person)
         self.in_channels = int(in_channels)
+        self.num_layers = num_layers
         base_channels = int(hidden_channels)
         output_channels = int(hidden_dim)
         adjacency = _ntu_spatial_adjacency()
 
         self.data_bn = nn.BatchNorm1d(
             self.num_person * self.in_channels * self.num_point)
-        self.layers = nn.ModuleList((
-            TCNGCNUnit(
-                self.in_channels, base_channels, adjacency,
-                residual=False, adaptive=adaptive),
-            TCNGCNUnit(
-                base_channels, base_channels, adjacency,
-                adaptive=adaptive),
-            TCNGCNUnit(
-                base_channels, base_channels, adjacency,
-                adaptive=adaptive),
-            TCNGCNUnit(
-                base_channels, base_channels, adjacency,
-                adaptive=adaptive),
-            TCNGCNUnit(
-                base_channels, base_channels * 2, adjacency,
-                stride=2, adaptive=adaptive),
-            TCNGCNUnit(
-                base_channels * 2, base_channels * 2, adjacency,
-                adaptive=adaptive),
-            TCNGCNUnit(
-                base_channels * 2, base_channels * 2, adjacency,
-                adaptive=adaptive),
-            TCNGCNUnit(
-                base_channels * 2, output_channels, adjacency,
-                stride=2, adaptive=adaptive),
-            TCNGCNUnit(
-                output_channels, output_channels, adjacency,
-                adaptive=adaptive),
-            TCNGCNUnit(
-                output_channels, output_channels, adjacency,
-                adaptive=adaptive),
-        ))
+        layers = []
+        layer_in_channels = self.in_channels
+        for layer_index, (width_multiplier, stride) in enumerate(
+                _DEPTH_PROFILES[num_layers]):
+            layer_out_channels = base_channels * width_multiplier
+            layers.append(TCNGCNUnit(
+                layer_in_channels, layer_out_channels, adjacency,
+                stride=stride, residual=layer_index != 0,
+                adaptive=adaptive))
+            layer_in_channels = layer_out_channels
+        if layer_in_channels != output_channels:
+            raise RuntimeError(
+                'CTR-GCN depth profile does not end at hidden_dim')
+        self.layers = nn.ModuleList(layers)
         self.dropout = (
             nn.Dropout(float(dropout))
             if float(dropout) > 0 else nn.Identity())
