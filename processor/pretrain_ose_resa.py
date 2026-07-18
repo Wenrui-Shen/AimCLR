@@ -44,6 +44,8 @@ class OSEResAProcessor(PT_Processor):
         self.model = self.io.load_model(
             self.arg.model, **model_args)
         self.model.apply(_weights_init)
+        if hasattr(self.model.encoder_q, 'reset_parameters'):
+            self.model.encoder_q.reset_parameters()
         self.model.reset_momentum_encoder()
         if not self.arg.ose_enabled:
             mode = 'ReSA-only'
