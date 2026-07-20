@@ -382,15 +382,16 @@ class OSEAimCLR(AimCLR):
 
         l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
         l_neg = torch.einsum(
-            'nc,ck->nk', [q, self.queue.detach()])
+            'nc,ck->nk', [q, self.queue.clone().detach()])
         l_pos_e = torch.einsum(
             'nc,nc->n', [q_extreme, k]).unsqueeze(-1)
         l_neg_e = torch.einsum(
-            'nc,ck->nk', [q_extreme, self.queue.detach()])
+            'nc,ck->nk', [q_extreme, self.queue.clone().detach()])
         l_pos_ed = torch.einsum(
             'nc,nc->n', [q_extreme_drop, k]).unsqueeze(-1)
         l_neg_ed = torch.einsum(
-            'nc,ck->nk', [q_extreme_drop, self.queue.detach()])
+            'nc,ck->nk', [
+                q_extreme_drop, self.queue.clone().detach()])
 
         logits = torch.cat([l_pos, l_neg], dim=1) / self.T
         logits_e = torch.cat([l_pos_e, l_neg_e], dim=1) / self.T

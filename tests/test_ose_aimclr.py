@@ -4,6 +4,7 @@ import unittest
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from net.ose_aimclr import OSEAimCLR
 from processor.pretrain_ose_aimclr import OSEAimCLR_Processor
@@ -147,7 +148,14 @@ class OSEAimCLRTest(unittest.TestCase):
         self.assertEqual(model.encoder_k.forward_feature_calls, 5)
         self.assertEqual(teacher_projector_bn.num_batches_tracked.item(), 1)
 
-        (losses['proto'] + losses['mix']).backward()
+        loss2 = -torch.mean(torch.sum(
+            torch.log(outputs[2].clamp_min(1e-12)) * outputs[4], dim=1))
+        loss3 = -torch.mean(torch.sum(
+            torch.log(outputs[3].clamp_min(1e-12)) * outputs[4], dim=1))
+        base_loss = (
+            F.cross_entropy(outputs[0], outputs[1]) +
+            (loss2 + loss3) / 2.0)
+        (base_loss + losses['proto'] + losses['mix']).backward()
         self.assertIsNotNone(model.encoder_q.input_layer.weight.grad)
         self.assertTrue(any(
             parameter.grad is not None
