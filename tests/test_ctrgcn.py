@@ -63,6 +63,43 @@ class CTRGCNTest(unittest.TestCase):
                 self.assertEqual(actual_channels, channels)
                 self.assertEqual(model.fc.in_features, 32)
 
+    def test_accepts_aimclr_stgcn_width_profile(self):
+        channels = [16, 16, 16, 16, 32, 32, 32, 64, 64, 256]
+        model = Model(
+            hidden_channels=16,
+            hidden_dim=256,
+            num_layers=10,
+            layer_channels=channels,
+            graph_args={
+                'layout': 'ntu-rgb+d',
+                'strategy': 'spatial',
+            })
+        actual_channels = [
+            layer.gcn.bn.num_features for layer in model.layers]
+        self.assertEqual(actual_channels, channels)
+        self.assertEqual(model.layer_channels, tuple(channels))
+        self.assertEqual(model.fc.in_features, 256)
+
+    def test_rejects_invalid_explicit_width_profile(self):
+        with self.assertRaisesRegex(ValueError, 'one value per layer'):
+            Model(
+                hidden_dim=256,
+                num_layers=10,
+                layer_channels=[16, 32, 256],
+                graph_args={
+                    'layout': 'ntu-rgb+d',
+                    'strategy': 'spatial',
+                })
+        with self.assertRaisesRegex(ValueError, 'equal hidden_dim'):
+            Model(
+                hidden_dim=256,
+                num_layers=10,
+                layer_channels=[16, 16, 16, 16, 32, 32, 32, 64, 64, 64],
+                graph_args={
+                    'layout': 'ntu-rgb+d',
+                    'strategy': 'spatial',
+                })
+
     def test_rejects_undefined_depth_profile(self):
         with self.assertRaisesRegex(ValueError, 'num_layers'):
             Model(

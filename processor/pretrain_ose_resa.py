@@ -31,6 +31,10 @@ class OSEResAProcessor(PT_Processor):
             raise ValueError('ose_mix_proto_weight must be non-negative')
         if self.arg.ose_mix_ins_weight < 0:
             raise ValueError('ose_mix_ins_weight must be non-negative')
+        if self.arg.ose_topk < 0:
+            raise ValueError('ose_topk must be non-negative')
+        if self.arg.ose_exemplar_views < 1:
+            raise ValueError('ose_exemplar_views must be at least 1')
         mix_enabled = (
             self.arg.ose_mix_proto_weight > 0 or
             self.arg.ose_mix_ins_weight > 0)
@@ -62,6 +66,12 @@ class OSEResAProcessor(PT_Processor):
                     self.arg.ose_mix_proto_weight,
                     self.arg.ose_mix_ins_weight,
                     self.arg.ose_mix_alpha))
+            self.io.print_log(
+                'OSE prototype | queue_neighbors {} | exemplar_views {} '
+                '(1 online + {} EMA)'.format(
+                    self.arg.ose_topk,
+                    self.arg.ose_exemplar_views,
+                    self.arg.ose_exemplar_views - 1))
 
     def load_data(self):
         super().load_data()
@@ -241,6 +251,12 @@ class OSEResAProcessor(PT_Processor):
         exemplars = exemplars.to(self.dev, non_blocking=True)
         return self._prepare_stream(exemplars)
 
+    def _exemplar_batches(self):
+        return [
+            self._exemplar_batch()
+            for _ in range(self.arg.ose_exemplar_views)
+        ]
+
     def _training_progress(self, epoch, batch_index, num_batches):
         return (epoch - 1) + float(batch_index + 1) / max(num_batches, 1)
 
@@ -319,7 +335,8 @@ class OSEResAProcessor(PT_Processor):
             momentum = self._momentum(progress)
 
             if self.arg.ose_enabled:
-                exemplar = self._exemplar_batch()
+                exemplar_views = self._exemplar_batches()
+                exemplar = exemplar_views[0]
                 losses = self.model(
                     view_a, view_b, exemplar,
                     momentum=momentum, ose_topk=self.arg.ose_topk,
@@ -331,7 +348,8 @@ class OSEResAProcessor(PT_Processor):
                     mix_index=mix_index,
                     mix_beta=mix_beta,
                     compute_mix_proto=compute_mix_proto,
-                    compute_mix_ins=compute_mix_ins)
+                    compute_mix_ins=compute_mix_ins,
+                    extra_exemplar_views=exemplar_views[1:])
                 loss = (losses['cluster'] +
                         self.arg.ose_lambda * losses['proto'])
                 if compute_mix_proto:
@@ -446,6 +464,9 @@ class OSEResAProcessor(PT_Processor):
         parser.add_argument('--ose_exclude_exemplars', type=str2bool,
                             default=True)
         parser.add_argument('--ose_topk', type=int, default=8)
+        parser.add_argument(
+            '--ose_exemplar_views', type=int, default=1,
+            help='total weak exemplar views: one online plus EMA views')
         parser.add_argument('--ose_alpha', type=float, default=0.75)
         parser.add_argument('--ose_tau_s', type=float, default=0.1)
         parser.add_argument('--ose_tau_t', type=float, default=0.04)

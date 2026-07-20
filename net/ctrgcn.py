@@ -312,7 +312,7 @@ class Model(nn.Module):
                  hidden_dim=256, num_class=60, dropout=0.0,
                  graph_args=None, edge_importance_weighting=True,
                  num_point=25, num_person=2, adaptive=True,
-                 num_layers=10, **kwargs):
+                 num_layers=10, layer_channels=None, **kwargs):
         super().__init__()
         del edge_importance_weighting, kwargs
         graph_args = graph_args or {}
@@ -327,20 +327,39 @@ class Model(nn.Module):
                 'CTR-GCN requires the spatial adjacency strategy')
         if int(num_point) != _NUM_POINT:
             raise ValueError('CTR-GCN NTU layout requires 25 joints')
-        if int(hidden_dim) != int(hidden_channels) * 4:
-            raise ValueError(
-                'CTR-GCN hidden_dim must equal 4 * hidden_channels')
         num_layers = int(num_layers)
         if num_layers not in _DEPTH_PROFILES:
             raise ValueError(
                 'CTR-GCN num_layers must be one of {}, received {}'
                 .format(sorted(_DEPTH_PROFILES), num_layers))
+        if layer_channels is None:
+            if int(hidden_dim) != int(hidden_channels) * 4:
+                raise ValueError(
+                    'CTR-GCN hidden_dim must equal 4 * hidden_channels '
+                    'when layer_channels is not provided')
+            layer_channels = [
+                int(hidden_channels) * width_multiplier
+                for width_multiplier, _ in _DEPTH_PROFILES[num_layers]]
+        else:
+            layer_channels = [int(channels) for channels in layer_channels]
+            if len(layer_channels) != num_layers:
+                raise ValueError(
+                    'CTR-GCN layer_channels must contain one value per layer')
+            if any(channels <= 0 for channels in layer_channels):
+                raise ValueError(
+                    'CTR-GCN layer_channels must all be positive')
+            if any(channels % 4 != 0 for channels in layer_channels):
+                raise ValueError(
+                    'CTR-GCN layer_channels must be divisible by 4')
+            if layer_channels[-1] != int(hidden_dim):
+                raise ValueError(
+                    'CTR-GCN final layer channel must equal hidden_dim')
 
         self.num_point = int(num_point)
         self.num_person = int(num_person)
         self.in_channels = int(in_channels)
         self.num_layers = num_layers
-        base_channels = int(hidden_channels)
+        self.layer_channels = tuple(layer_channels)
         output_channels = int(hidden_dim)
         adjacency = _ntu_spatial_adjacency()
 
@@ -348,9 +367,8 @@ class Model(nn.Module):
             self.num_person * self.in_channels * self.num_point)
         layers = []
         layer_in_channels = self.in_channels
-        for layer_index, (width_multiplier, stride) in enumerate(
-                _DEPTH_PROFILES[num_layers]):
-            layer_out_channels = base_channels * width_multiplier
+        for layer_index, (layer_out_channels, (_, stride)) in enumerate(
+                zip(self.layer_channels, _DEPTH_PROFILES[num_layers])):
             layers.append(TCNGCNUnit(
                 layer_in_channels, layer_out_channels, adjacency,
                 stride=stride, residual=layer_index != 0,

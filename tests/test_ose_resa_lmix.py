@@ -33,6 +33,9 @@ class OSEResALmixTest(unittest.TestCase):
         self.view_a = torch.randn(self.batch_size, 3, 4, 5, 1)
         self.view_b = torch.randn(self.batch_size, 3, 4, 5, 1)
         self.exemplar = torch.randn(self.num_classes, 3, 4, 5, 1)
+        self.extra_exemplar_views = [
+            torch.randn(self.num_classes, 3, 4, 5, 1)
+            for _ in range(4)]
         self.sample_indices = torch.arange(self.batch_size)
 
     def _model(self):
@@ -136,6 +139,35 @@ class OSEResALmixTest(unittest.TestCase):
             compute_mix_ins=True)
         self.assertEqual(instance_losses['mix_proto'].item(), 0.0)
         self.assertGreater(instance_losses['mix_ins'].item(), 0.0)
+
+    def test_multi_view_exemplar_prototype_uses_ema_views_without_neighbors(self):
+        model = self._model()
+        model.train()
+        teacher_projector_bn = model.projector_k[1]
+        losses = model(
+            self.view_a, self.view_b, self.exemplar,
+            sample_indices=self.sample_indices,
+            ose_topk=0,
+            extra_exemplar_views=self.extra_exemplar_views)
+
+        self.assertTrue(torch.isfinite(losses['proto']))
+        self.assertEqual(
+            tuple(losses['neighbor_sample_indices'].shape),
+            (self.num_classes, 0))
+        self.assertEqual(model.encoder_q.forward_feature_calls, 3)
+        self.assertEqual(model.encoder_k.forward_feature_calls, 6)
+        self.assertEqual(model.queue_ptr.item(), self.batch_size)
+        self.assertEqual(model.queue_filled.item(), self.batch_size)
+        self.assertEqual(teacher_projector_bn.num_batches_tracked.item(), 2)
+
+        losses['proto'].backward()
+        self.assertIsNotNone(model.encoder_q.input_layer.weight.grad)
+        self.assertTrue(all(
+            parameter.grad is None
+            for parameter in model.encoder_k.parameters()))
+        self.assertTrue(all(
+            parameter.grad is None
+            for parameter in model.projector_k.parameters()))
 
 
 if __name__ == '__main__':

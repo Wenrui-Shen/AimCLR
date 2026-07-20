@@ -129,41 +129,63 @@ class OSEResA(nn.Module):
     def _soft_cross_entropy(logits, target):
         return -(target * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
 
-    def _class_prototypes(self, exemplar_z, topk, alpha):
+    def _class_prototypes(self, exemplar_z, topk, alpha,
+                          extra_exemplar_z=None):
         exemplar_z = F.normalize(exemplar_z, dim=1)
+        if extra_exemplar_z is not None:
+            if extra_exemplar_z.dim() != 3:
+                raise ValueError(
+                    'Extra exemplar embeddings must have shape [C, R, D]')
+            expected = (
+                exemplar_z.size(0), extra_exemplar_z.size(1),
+                exemplar_z.size(1))
+            if tuple(extra_exemplar_z.shape) != expected:
+                raise ValueError(
+                    'Extra exemplar embeddings do not align with anchors')
+            extra_exemplar_z = F.normalize(extra_exemplar_z, dim=2)
+
         filled = int(self.queue_filled.item())
-        if filled == 0:
+        neighbor_count = min(max(int(topk), 0), filled)
+        neighbor_indices = None
+        memory = None
+        if neighbor_count > 0:
+            memory = F.normalize(
+                self.queue[:, :filled].detach().t(), dim=1)
+            similarity = torch.matmul(exemplar_z, memory.t())
+
+            if exemplar_z.size(0) > 1:
+                other_similarity = similarity.unsqueeze(0).expand(
+                    exemplar_z.size(0), -1, -1).clone()
+                diagonal = torch.eye(
+                    exemplar_z.size(0), dtype=torch.bool,
+                    device=exemplar_z.device)
+                other_similarity[diagonal] = -float('inf')
+                max_other = other_similarity.max(dim=1)[0]
+            else:
+                max_other = torch.zeros_like(similarity)
+
+            score = (
+                float(alpha) * similarity -
+                (1.0 - float(alpha)) * max_other)
+            neighbor_indices = torch.topk(
+                score, k=neighbor_count, dim=1).indices
+            neighbor_sample_indices = self.queue_sample_indices[
+                :filled][neighbor_indices].detach()
+        else:
             neighbor_sample_indices = torch.empty(
                 exemplar_z.size(0), 0, dtype=torch.long,
                 device=exemplar_z.device)
-            return exemplar_z, neighbor_sample_indices
-
-        memory = F.normalize(self.queue[:, :filled].detach().t(), dim=1)
-        similarity = torch.matmul(exemplar_z, memory.t())
-
-        if exemplar_z.size(0) > 1:
-            other_similarity = similarity.unsqueeze(0).expand(
-                exemplar_z.size(0), -1, -1).clone()
-            diagonal = torch.eye(
-                exemplar_z.size(0), dtype=torch.bool,
-                device=exemplar_z.device)
-            other_similarity[diagonal] = -float('inf')
-            max_other = other_similarity.max(dim=1)[0]
-        else:
-            max_other = torch.zeros_like(similarity)
-
-        score = float(alpha) * similarity - (1.0 - float(alpha)) * max_other
-        neighbor_count = min(int(topk), memory.size(0))
-        neighbor_indices = torch.topk(
-            score, k=neighbor_count, dim=1).indices
-        neighbor_sample_indices = self.queue_sample_indices[
-            :filled][neighbor_indices].detach()
 
         prototypes = []
         for class_index in range(exemplar_z.size(0)):
-            neighbors = memory[neighbor_indices[class_index]]
-            components = torch.cat(
-                [exemplar_z[class_index:class_index + 1], neighbors], dim=0)
+            component_groups = [
+                exemplar_z[class_index:class_index + 1]]
+            if extra_exemplar_z is not None:
+                component_groups.append(extra_exemplar_z[class_index])
+            if neighbor_count > 0:
+                component_groups.append(
+                    memory[neighbor_indices[class_index]])
+            components = torch.cat(component_groups, dim=0)
             weights = torch.softmax(
                 torch.matmul(components, exemplar_z[class_index]), dim=0)
             prototypes.append(
@@ -227,6 +249,36 @@ class OSEResA(nn.Module):
         return F.normalize(self.projector_q(features), dim=1)
 
     @torch.no_grad()
+    def _teacher_exemplar_projection(self, exemplar):
+        modules = (self.encoder_k, self.projector_k)
+        batch_norm_state = []
+        for module in modules:
+            for child in module.modules():
+                if isinstance(child, (
+                        nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    batch_norm_state.append((
+                        child,
+                        (child.running_mean.clone()
+                         if child.running_mean is not None else None),
+                        (child.running_var.clone()
+                         if child.running_var is not None else None),
+                        (child.num_batches_tracked.clone()
+                         if child.num_batches_tracked is not None else None),
+                    ))
+        try:
+            features = self.encoder_k.forward_features(exemplar)
+            projected = self.projector_k(features)
+        finally:
+            for child, running_mean, running_var, batches in batch_norm_state:
+                if running_mean is not None:
+                    child.running_mean.copy_(running_mean)
+                if running_var is not None:
+                    child.running_var.copy_(running_var)
+                if batches is not None:
+                    child.num_batches_tracked.copy_(batches)
+        return F.normalize(projected, dim=1)
+
+    @torch.no_grad()
     def _teacher_embeddings(self, view_a, view_b):
         view_a_features = self.encoder_k.forward_features(view_a)
         view_b_features = self.encoder_k.forward_features(view_b)
@@ -243,7 +295,7 @@ class OSEResA(nn.Module):
                 ose_tau_s=0.1, ose_tau_t=0.04,
                 sample_indices=None, mixed_view=None, mix_index=None,
                 mix_beta=None, compute_mix_proto=False,
-                compute_mix_ins=False):
+                compute_mix_ins=False, extra_exemplar_views=None):
         if not self.pretrain:
             return self.encoder_q(view_a)
         if view_b is None:
@@ -267,10 +319,26 @@ class OSEResA(nn.Module):
             if exemplar is None:
                 raise ValueError('ReSA+Lproto requires exemplar inputs')
             exemplar_z = self._exemplar_embedding(exemplar)
+            if extra_exemplar_views is None:
+                extra_exemplar_views = []
+            if not isinstance(extra_exemplar_views, (tuple, list)):
+                raise ValueError(
+                    'extra_exemplar_views must be a list or tuple')
+            for extra_view in extra_exemplar_views:
+                if extra_view.size(0) != exemplar.size(0):
+                    raise ValueError(
+                        'All exemplar views must contain the same classes')
         with torch.no_grad():
             self._momentum_update(momentum)
             teacher_h, teacher_z = self._teacher_embeddings(
                 view_a, view_b)
+            if self.ose_enabled and extra_exemplar_views:
+                extra_exemplar_z = torch.stack([
+                    self._teacher_exemplar_projection(extra_view)
+                    for extra_view in extra_exemplar_views
+                ], dim=1)
+            else:
+                extra_exemplar_z = None
 
         assignment = self._sinkhorn_knopp(
             torch.matmul(online_h[0].detach(), teacher_h[0].t()))
@@ -300,7 +368,8 @@ class OSEResA(nn.Module):
             return result
 
         prototypes, neighbor_sample_indices = self._class_prototypes(
-            exemplar_z, topk=ose_topk, alpha=ose_alpha)
+            exemplar_z, topk=ose_topk, alpha=ose_alpha,
+            extra_exemplar_z=extra_exemplar_z)
         student_logits = torch.matmul(
             online_z[1], prototypes.t()) / max(float(ose_tau_s), 1e-12)
         teacher_logits = torch.matmul(
