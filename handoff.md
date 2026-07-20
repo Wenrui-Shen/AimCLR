@@ -618,6 +618,7 @@ vs
 7. LP 改为正式 200 epoch，独立 work_dir。
 8. 测试锁定 AimCLR baseline 3 次、MV4 M-F 9 次 backbone forward；正式运行仍需记录显存和 iter time。
 9. 添加 loader 排除、prototype component、loss switch 和梯度路径测试。
+10. `ose_warmup_epoch: 0`，从 epoch 1 的第一个 batch 同时启用 AimCLR、Lproto 和配置的 Lmix。
 
 建议实验顺序：
 

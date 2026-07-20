@@ -254,6 +254,12 @@ class OSEAimCLRTest(unittest.TestCase):
                 processor.ose_exemplar_indices):
             self.assertEqual(dataset.label[index], class_id)
 
+    def test_zero_warmup_enables_ose_in_first_epoch(self):
+        processor = OSEAimCLR_Processor.__new__(OSEAimCLR_Processor)
+        processor.arg = types.SimpleNamespace(
+            ose_enabled=True, ose_warmup_epoch=0)
+        self.assertTrue(processor._ose_active(1))
+
 
 if __name__ == '__main__':
     unittest.main()

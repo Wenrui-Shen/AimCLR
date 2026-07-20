@@ -477,7 +477,7 @@ class OSEAimCLR_Processor(AimCLR_Processor):
         parser.add_argument('--ose_exemplar_index_path', type=str, default='')
         parser.add_argument('--ose_exclude_exemplars', type=str2bool,
                             default=True)
-        parser.add_argument('--ose_warmup_epoch', type=int, default=20)
+        parser.add_argument('--ose_warmup_epoch', type=int, default=0)
         parser.add_argument('--ose_topk', type=int, default=8)
         parser.add_argument(
             '--ose_exemplar_views', type=int, default=1,

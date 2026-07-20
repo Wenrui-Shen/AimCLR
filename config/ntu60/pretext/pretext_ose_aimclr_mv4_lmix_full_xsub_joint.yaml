@@ -55,7 +55,8 @@ ose_exemplar_seed: 0
 # Reuse the validated seed-0 exemplars from the ReSA row.
 ose_exemplar_index_path: ./data/ntu60_cs/ose_resa_weak_dropout0_joint/exemplar_seed0.npy
 ose_exclude_exemplars: True
-ose_warmup_epoch: 20
+# Enable Lproto/Lmix from epoch 1; no AimCLR-only warmup.
+ose_warmup_epoch: 0
 ose_topk: 0
 ose_exemplar_views: 5
 ose_alpha: 0.75
