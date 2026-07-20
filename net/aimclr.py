@@ -69,10 +69,25 @@ class AimCLR(nn.Module):
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys):
-        batch_size = keys.shape[0]
-        ptr = int(self.queue_ptr)
-        gpu_index = keys.device.index
-        self.queue[:, (ptr + batch_size * gpu_index):(ptr + batch_size * (gpu_index + 1))] = keys.T
+        """Write one logical single-GPU batch at the current queue pointer.
+
+        The historical implementation offset the write by ``device.index``.
+        That makes a process running directly on ``cuda:1`` write to the wrong
+        queue slice and also fails on CPU.  Formal experiments in this project
+        are single-GPU, so the queue position is determined only by
+        ``queue_ptr``; the processor advances that pointer once after forward.
+        """
+        keys = keys.detach()
+        if keys.size(0) >= self.K:
+            keys = keys[-self.K:]
+
+        batch_size = keys.size(0)
+        ptr = int(self.queue_ptr.item())
+        first_count = min(batch_size, self.K - ptr)
+        self.queue[:, ptr:ptr + first_count] = keys[:first_count].t()
+        remaining = batch_size - first_count
+        if remaining > 0:
+            self.queue[:, :remaining] = keys[first_count:].t()
 
     @torch.no_grad()
     def update_ptr(self, batch_size):
@@ -120,7 +135,8 @@ class AimCLR(nn.Module):
         # apply temperature
         logits /= self.T
         # labels: positive key indicators
-        labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
+        labels = torch.zeros(
+            logits.shape[0], dtype=torch.long, device=logits.device)
 
         # Compute logits_e of extremely augmented query using Einstein sum
         # positive logits: Nx1
@@ -209,7 +225,11 @@ class AimCLR(nn.Module):
         topk_onehot.scatter_(1, topkdix_e, 1)
         topk_onehot.scatter_(1, topkdix_ed, 1)
 
-        pos_mask = torch.cat([torch.ones(topk_onehot.size(0), 1).cuda(), topk_onehot], dim=1)
+        pos_mask = torch.cat([
+            torch.ones(
+                topk_onehot.size(0), 1, device=topk_onehot.device),
+            topk_onehot,
+        ], dim=1)
 
         self._dequeue_and_enqueue(k)
 

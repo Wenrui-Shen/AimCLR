@@ -1,8 +1,6 @@
-# LEGACY historical configuration for the old ~66 experiment.
-# Do not run it with the modern processor; use the explicit MV4/Q4 configs.
-work_dir: ./data/ntu60_cs/ose_aimclr_joint/pretext
+work_dir: ./data/ntu60_cs/ose_aimclr_mv4_lmix_full_dropout0_300ep_joint/pretext
 
-# feeder
+# Run with: python main.py pretrain_ose_aimclr --config <this file>
 train_feeder: feeder.ntu_feeder.Feeder_triple
 train_feeder_args:
   data_path: ../data/pstl/xsub/train_position.npy
@@ -10,8 +8,8 @@ train_feeder_args:
   shear_amplitude: 0.5
   temperal_padding_ratio: 6
   mmap: True
+  return_index: True
 
-# model
 model: net.ose_aimclr.OSEAimCLR
 model_args:
   base_encoder: net.st_gcn.Model
@@ -22,23 +20,25 @@ model_args:
   Temperature: 0.07
   mlp: True
   in_channels: 3
-  hidden_channels: 16 # 1/4 x channels of standard stgcn
+  hidden_channels: 16
   hidden_dim: 256
   num_class: 60
-  dropout: 0.5
+  dropout: 0.0
   graph_args:
     layout: 'ntu-rgb+d'
     strategy: 'spatial'
   edge_importance_weighting: True
+  ose_feature_dim: 256
+  ose_projector_hidden_dim: 2048
+  ose_projector_layers: 3
+  ose_queue_size: 8192
 
-# optim
 nesterov: False
 weight_decay: 1e-4
 base_lr: 0.1
 optimizer: SGD
 step: [250]
 
-# training
 device: [0]
 batch_size: 128
 test_batch_size: 128
@@ -46,23 +46,25 @@ num_epoch: 300
 start_epoch: 0
 stream: 'joint'
 
-# nearest neighbor mining
 topk: 1
 mining_epoch: 150
 
-# one-shot exemplar grounding
+ose_enabled: True
 ose_num_class: 60
 ose_exemplar_seed: 0
-ose_exemplar_index_path: ./data/ntu60_cs/ose_aimclr_joint/exemplar_seed0.npy
+# Reuse the validated seed-0 exemplars from the ReSA row.
+ose_exemplar_index_path: ./data/ntu60_cs/ose_resa_weak_dropout0_joint/exemplar_seed0.npy
+ose_exclude_exemplars: True
 ose_warmup_epoch: 20
-ose_topk: 8
+ose_topk: 0
+ose_exemplar_views: 5
 ose_alpha: 0.75
 ose_tau_s: 0.1
 ose_tau_t: 0.04
 ose_lambda: 1.0
-ose_mu: 1.0
+ose_mix_proto_weight: 1.0
+ose_mix_ins_weight: 1.0
 ose_mix_alpha: 1.0
 
-# log
 save_interval: 5
 eval_interval: -1
