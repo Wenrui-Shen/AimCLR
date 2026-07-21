@@ -1,56 +1,112 @@
-# AimCLR / ReSA / OSE / CTR-GCN 实验交接
+# AimCLR / ReSA / OSE 实验交接
 
-> 面向完全没有上下文的新会话。最后更新：2026-07-21。
+> 面向一个完全没有上下文的新会话。最后更新：2026-07-21。
 >
-> 请先完整阅读本文，再检查代码和服务器状态。不要根据旧聊天标题或文件名猜测实验协议。
+> 接手后请先完整阅读本文，再检查代码、配置和服务器状态。不要从旧聊天标题、旧目录名或
+> checkpoint 名字猜实验协议，也不要未经用户确认启动、停止或覆盖服务器任务。
 
-## 0. 一句话概况
+## 0. 最重要的结论和最新决定
 
-我们正在研究：用每类一个带标签 exemplar 构造 OSE 类别原型，把 `Lproto`、`Lmix-proto`
-和 `Lmix-ins` 加到骨架自监督基线上，并回答两个问题：
+我们正在研究 OSE（One-Shot Exemplar）能否作为骨架自监督学习的即插即用类别空间模块：
+每个动作类别只使用一个固定带标签 exemplar 构造类别原型，让无标签样本在预训练期间接触
+类别空间，再用正式 linear evaluation 衡量表征质量。
 
-1. 原型使用无标签 queue 邻居还是同一带标签 exemplar 的多个弱增强视图更好？
-2. OSE 与 ReSA、AimCLR 分别是否存在目标冲突，以及 ST-GCN 换成 CTR-GCN 后效果和代价如何？
-
-当前最重要的实验事实是：
+已经得到的核心结果（NTU60 xsub joint，ST-GCN，weak+weak，dropout0，pretext300，LP200）：
 
 ```text
-ST-GCN + ReSA + OSE M-F
-Q8: 78.80
-Q4: 79.98
-Q0: 77.22
+ReSA + OSE M-F
+Q8:  78.80
+Q4:  79.98
+Q0:  77.22
 MV4: 79.47
+
+现代 AimCLR + OSE MV4 M-F
+LP: 约 72.56
 ```
 
-MV4 比单视图 Q0 高 2.25，距离 Q4 只差 0.51，说明同一 exemplar 的多个独立弱增强
-已经补回大部分有效变化。Q4 仍略高，但单次实验的 0.51 差距不足以证明两者存在稳定差异。
-不能把结论简化为“top-k 越低越好”或“弱多视图已经严格等价于真实实例邻居”。
+`Q4` 表示一个在线 exemplar anchor 加 4 个无标签 OSE queue 邻居；`MV4` 表示一个在线
+弱增强 exemplar 视图加 4 个 EMA 弱增强视图，总 prototype component 数都为 5。
 
-当前代码已经实现纯弱增强多视图原型（MV4）、10 层 ST-GCN 宽度的 CTR-GCN，以及
-按当前协议重构的现代 AimCLR+OSE。CTR 尚无可比较结果，AimCLR A0/A1/A2 尚未运行。
-旧 AimCLR+OSE 的 LP 约 66，经检查不能直接证明理论冲突，因为旧实现和评估协议也存在
-多项混杂问题。
+ReSA 中 MV4 比 Q0 高 2.25，说明多弱视图补回了大部分有效变化；MV4 只比 Q4 低 0.51，
+单 seed 不足以证明差距稳定。现代 AimCLR+OSE MV4 M-F 跑出约 72.56，明显不理想，但
+当前尚没有同协议 A0（原版 AimCLR）的正式结果，不能精确声称“比 A0 降了多少”。
 
-## 1. 工作区与统一实验协议
+目前的工作假设是：AimCLR 的 instance queue 把所有历史非配对样本当负样本，其中存在
+同类别假负样本；OSE 又希望共享 encoder 暴露类别聚集结构。单纯把 OSE loss 叠到 AimCLR
+上可能产生实例均匀化与类别聚集之间的目标冲突。把 OSE 从 epoch 1 启用还是稍后启用不是
+主要解释，因为 ReSA+OSE 也是从 epoch 1 启用且效果良好。
+
+### 用户刚刚确认的下一步
+
+不继续优先做 AimCLR A0/A1/A2，也暂不继续 CTR-GCN；下一步考虑并实现：
+
+> **ST-GCN ReSA Q4+M-F + OSE 类别修正的双 weak instance queue 对比学习。**
+
+新增 queue 对比 loss 的权重固定为：
+
+```yaml
+queue_contrast_weight: 1.0
+```
+
+不要把它误写成“四个标量 loss”。ReSA Q4+M-F 原本已经有四项：
+
+```text
+Lcluster + Lproto + Lmix-proto + Lmix-ins
+```
+
+加入修正 queue 对比后，实际总目标是五个标量项：
+
+```text
+Ltotal = Lcluster
+       + 1.0 * Lproto
+       + 1.0 * Lmix-proto
+       + 1.0 * Lmix-ins
+       + 1.0 * Lqueue-corr
+```
+
+若把 `Lmix-proto + Lmix-ins` 合称 M-F，可以口头称“四组目标”，但代码、日志和论文描述
+必须明确实际是五项 loss。
+
+## 1. 工作区、仓库和统一实验协议
 
 ```text
 本地仓库：D:\Program\codex\program\AimCLR
 服务器：/home/user9/public3/swr/AimCLR
-服务器环境：swr_aimclr
+服务器 conda 环境：swr_aimclr
 Dataset：NTU60
 Protocol：xsub
 Stream：joint
 输入：[N, 3, 50, 25, 2]
+Backbone：当前正式主线使用 ST-GCN
 Pretext：300 epochs
-正式 linear evaluation：200 epochs
+Linear evaluation：200 epochs
 Batch size：128
-正式增强：weak + weak
+增强：weak + weak
 Dropout：0
-单 GPU
+正式训练：单 GPU
 ```
 
-服务器数据和 checkpoint 不在本地工作区。不要假设本地配置的 `device` 与服务器当前
-设备相同。
+服务器数据、日志和 checkpoint 不在本地仓库。配置中的 `device` 不代表服务器当前空闲卡，
+每次运行前都必须重新确认。
+
+在本次 handoff 编辑之前，工作区是干净的，最新提交为：
+
+```text
+c24df06 aimclr change
+5dad59f epoch change
+46030cf aimclr rechange
+2d584eb ose proto change and ctrgcn test
+93438d2 ctrgcn layer
+9bcbf9d ctrgcn
+676f680 Lmix
+a98e33d OSEchange
+```
+
+`c24df06` 已包含 AimCLR queue 原地修改导致 backward 失败的修复和相应测试。本次只修改
+`handoff.md`；不要误以为现代 AimCLR+OSE 仍是未提交代码。
+
+本地 Python 没有可用的 `torch`，只能做语法/静态检查；动态测试要到服务器环境运行。
+没有实际看到服务器测试输出之前，不要声称动态测试已通过。
 
 统一术语：
 
@@ -61,24 +117,25 @@ M-P       = B0 + Lmix-proto
 M-F       = B0 + Lmix-proto + Lmix-ins
 ```
 
-不要再用含糊的 “proto-only” 指代不同 loss 组合。
+不要用含糊的 “proto-only” 指代不同 loss 组合。
 
-## 2. 已得到的 ST-GCN 正式结果
+## 2. 已有正式结果和仍缺失的结果
 
-以下均为 NTU60 xsub joint、weak+weak、dropout0、batch128。正式横向比较应使用
+以下 ST-GCN 结果均为 NTU60 xsub joint、weak+weak、dropout0、batch128。正式横向比较使用
 pretext300 和 LP200。
 
-| 版本 | Pretext checkpoint | OSE queue top-k | exemplar views | LP Top-1 |
+| 版本 | Pretext checkpoint | OSE top-k | exemplar views | LP Top-1 |
 |---|---:|---:|---:|---:|
-| B0 | 120 | 8 | 1 | 74.39 |
-| B0 | 300 | 8 | 1 | 75.95 |
-| M-P | 300 | 8 | 1 | 78.20 |
-| M-F | 300 | 8 | 1 | 78.80 |
-| M-F | 300 | 4 | 1 | **79.98** |
-| M-F | 300 | 0 | 1 | **77.22** |
-| M-F / MV4 | 300 | 0 | 5 | **79.47** |
+| ReSA B0 | 120 | 8 | 1 | 74.39 |
+| ReSA B0 | 300 | 8 | 1 | 75.95 |
+| ReSA M-P | 300 | 8 | 1 | 78.20 |
+| ReSA M-F | 300 | 8 | 1 | 78.80 |
+| ReSA M-F | 300 | 4 | 1 | **79.98** |
+| ReSA M-F | 300 | 0 | 1 | **77.22** |
+| ReSA M-F / MV4 | 300 | 0 | 5 | **79.47** |
+| AimCLR + OSE MV4 M-F | 300 | 0 | 5 | **约 72.56** |
 
-已确认的差值：
+已确认的 ReSA 差值：
 
 ```text
 Q4 - Q8 = +1.18
@@ -94,85 +151,126 @@ M-F - B0 = +2.85
 Lmix-ins 在 M-P 上额外贡献 = +0.60
 ```
 
-解释：
+必须牢记：
 
-- Q8 到 Q4 提升，支持“降低邻居污染、提高原型纯度”。
-- Q4 到 Q0 大幅下降，说明不能无限降低 top-k。
-- Q0 的 77.22 使用的是 `ose_exemplar_views: 1`，即只有一个在线 exemplar 视图；
-  它不是多弱增强原型实验。
-- Q4 的原型实际有五个组成：一个 exemplar anchor + 四个 queue 邻居。
-- 新 MV4 也刻意使用五个组成：一个在线弱增强 + 四个 EMA 弱增强，以便公平比较
-  “组成数量相同、来源不同”。
-- MV4=79.47 表明弱多视图能补回 Q0 丢失的大部分信息；Q4 的真实类内实例目前只保留
-  0.51 的小幅优势，最终是否稳定需要后续多 seed，而不是现在继续调 MV1/MV2。
+- Q0=77.22 是单个在线 exemplar 视图，不是 MV4。
+- Q4 和 MV4 都有 5 个 prototype components，但来源不同。
+- AimCLR 约 72.56 使用的是现代重构后的 MV4 M-F，不是旧约 66 的实现。
+- 同协议 A0（原版 AimCLR）结果尚未在当前会话中报告，因此不能定量写 A1 相比 baseline
+  下降多少；用户主观确认它表现偏低，但论文结论仍需 A0。
+- 用户跑过 CTR-GCN epoch120 的 LP 并感觉偏低，但准确 Top-1 没有在当前会话记录，绝对
+  不要猜数字。
+- 当前唯一明确记录的 ST-GCN epoch120 数字是 ReSA B0 Q8 的 74.39；没有 ST-GCN
+  Q4 M-F epoch120 的已知结果。
+- 不得混用不同 total-epoch cosine schedule 下的同名 epoch checkpoint。
 
-历史上的 500-epoch schedule 或不同总 epoch 下的同名 checkpoint 不得混入上表。
-Cosine LR 依赖总 epoch，同名 epoch 并不代表相同训练状态。
+## 3. 已经完成的代码工作
 
-## 3. 当前代码状态
-
-写本文前工作区是干净的，最新提交为：
-
-```text
-2d584eb ose proto change and ctrgcn test
-93438d2 ctrgcn layer
-9bcbf9d ctrgcn
-676f680 Lmix
-a98e33d OSEchange
-9725427 dropout change and augmentation change
-d622e0b resa
-```
-
-当前工作区除本文件外，还有尚未提交的现代 AimCLR+OSE 重构、配置和测试。不要误删或
-用旧版 `OSEAimCLR` 覆盖。
+### 3.1 ReSA+OSE 和 MV4
 
 关键文件：
 
 ```text
 net/ose_resa.py
 processor/pretrain_ose_resa.py
-net/ctrgcn.py
+feeder/ntu_feeder.py
+tests/test_ose_resa_lmix.py
+```
+
+已实现：
+
+- ReSA 的 `Lcluster`。
+- OSE `Lproto`、`Lmix-proto`、`Lmix-ins`。
+- Q0/Q4/Q8 的 OSE neighbor prototype。
+- MV4：1 个 online weak exemplar + 4 个 EMA weak exemplar views。
+- exemplar 从无标签 loader 排除。
+- exemplar cache 的 class、index、seed、样本数和标签一致性校验。
+- mixed branch、prototype component 和梯度路径测试。
+
+MV4 配置：
+
+```text
+config/ntu60/pretext/pretext_ose_resa_lmix_full_mv4_xsub_joint.yaml
+config/ntu60/linear_eval/linear_eval_ose_resa_lmix_full_mv4_xsub_joint.yaml
+```
+
+MV4 的四个额外 EMA exemplar forward 会保存并恢复 teacher BN running mean、running var
+和 `num_batches_tracked`，避免同一 iteration 重复污染 EMA BN buffer。
+
+### 3.2 CTR-GCN
+
+`net/ctrgcn.py` 已支持 10-layer、ST-GCN-matched widths：
+
+```yaml
+num_layers: 10
+layer_channels: [16, 16, 16, 16, 32, 32, 32, 64, 64, 256]
+```
+
+这不是官方宽度 CTR-GCN。对应配置：
+
+```text
+config/ntu60/pretext/pretext_ose_resa_ctrgcn10_stwidth_q4_lmix_full_xsub_joint.yaml
+config/ntu60/linear_eval/linear_eval_ose_resa_ctrgcn10_stwidth_q4_lmix_full_xsub_joint.yaml
+```
+
+服务器实测约 2.16 秒/iter，完整 pretext300 估计约 58–62 小时，用户认为不可接受。
+目前服务器 CTR 进程状态未知；不要擅自停止、续跑或删除。
+
+### 3.3 现代 AimCLR+OSE 重构
+
+关键文件：
+
+```text
 net/aimclr.py
 net/ose_aimclr.py
 processor/pretrain_ose_aimclr.py
-feeder/ntu_feeder.py
-tests/test_ose_resa_lmix.py
 tests/test_ose_aimclr.py
-tests/test_ctrgcn.py
 ```
 
-现有 ReSA/CTR 配置和本次新增的 AimCLR 配置：
+配置：
 
 ```text
-config/ntu60/pretext/
-  pretext_ose_resa_lmix_full_mv4_xsub_joint.yaml
-  pretext_ose_resa_ctrgcn10_stwidth_q4_lmix_full_xsub_joint.yaml
-  pretext_aimclr_a0_xsub_joint.yaml
-  pretext_ose_aimclr_mv4_lmix_full_xsub_joint.yaml
-  pretext_ose_aimclr_q4_lmix_full_xsub_joint.yaml
+config/ntu60/pretext/pretext_aimclr_a0_xsub_joint.yaml
+config/ntu60/pretext/pretext_ose_aimclr_mv4_lmix_full_xsub_joint.yaml
+config/ntu60/pretext/pretext_ose_aimclr_q4_lmix_full_xsub_joint.yaml
 
-config/ntu60/linear_eval/
-  linear_eval_ose_resa_lmix_full_mv4_xsub_joint.yaml
-  linear_eval_ose_resa_ctrgcn10_stwidth_q4_lmix_full_xsub_joint.yaml
-  linear_eval_aimclr_a0_xsub_joint.yaml
-  linear_eval_ose_aimclr_mv4_lmix_full_xsub_joint.yaml
-  linear_eval_ose_aimclr_q4_lmix_full_xsub_joint.yaml
+config/ntu60/linear_eval/linear_eval_aimclr_a0_xsub_joint.yaml
+config/ntu60/linear_eval/linear_eval_ose_aimclr_mv4_lmix_full_xsub_joint.yaml
+config/ntu60/linear_eval/linear_eval_ose_aimclr_q4_lmix_full_xsub_joint.yaml
 ```
 
-本地静态编译检查曾通过。由于本地 Python 没有可用的 `torch`，动态单元测试必须在
-服务器环境执行：
+重构已完成：
 
-```bash
-python -m unittest tests.test_ctrgcn tests.test_ose_resa_lmix tests.test_ose_aimclr
+- 保留 AimCLR 原生 128-D instance head 和 32768 queue。
+- OSE 使用独立 256-D、3-layer projector 和独立 OSE neighbor queue。
+- MV4 的 `ose_topk: 0` 不读也不写 OSE neighbor queue。
+- 支持 B0、M-P、M-F 独立 loss 开关。
+- exemplar 严格从无标签 loader 排除。
+- LP 改为 200 epochs，使用独立 work_dir。
+- `ose_warmup_epoch: 0`，从 epoch 1 第一个 batch 启用 OSE；不要恢复“前 20 epoch 只跑
+  AimCLR”的旧 schedule。
+
+首次服务器运行曾在 epoch 1 backward 报错：
+
+```text
+RuntimeError: one of the variables needed for gradient computation has been modified
+by an inplace operation: [1, 128, 32768]
 ```
 
-不要声称服务器动态测试已经通过，除非新会话实际运行并看到结果。
+原因是负样本 logits 使用 `self.queue.detach()`，它仍与原 queue 共享存储；forward 在
+backward 前 enqueue 覆盖了 queue，触发 autograd version mismatch。修复是所有相关负样本
+路径都使用：
 
-## 4. 当前 ReSA+OSE 实现必须保持的语义
+```python
+self.queue.clone().detach()
+```
 
-### 4.1 特征空间
+该修复和 backward 测试已提交在 `c24df06`。随后现代 AimCLR+OSE MV4 M-F 已能完成训练
+并得到约 72.56 LP。
 
-当前 ReSA 本身有三种表示：
+## 4. 必须保持的 ReSA/OSE 语义
+
+ReSA 当前有三种表示：
 
 ```text
 H：encoder 特征
@@ -180,20 +278,10 @@ Z：projector 特征
 Q：predictor 输出
 ```
 
-当前代码：
-
 - ReSA 的 Sinkhorn assignment 从 encoder `H` 的 batch 关系构造。
-- ReSA 的跨视图预测 loss 使用 `Q` 对 teacher `Z`。
-- OSE exemplar、queue、prototype、mixed branch 都在 projector `Z` 空间。
-
-ReSA 论文关于 encoder 特征更适合聚类的分析，不代表可以直接把 OSE 原型随手换到
-`H`。OSE 的分类分布、teacher target 和 mixed embedding 当前都在 `Z`；如果测试
-encoder-space prototype，必须作为独立 Q4 消融，统一修改 prototype、student logits、
-teacher target 和 mix 分支的空间，不能混用 H/Z/Q。
-
-该 H-vs-Z 消融仍未实现、未运行，优先级低于 MV4 和干净的 AimCLR 对照。
-
-### 4.2 Lmix
+- ReSA 跨视图预测使用 online predictor `Q` 对 teacher projector `Z`。
+- OSE exemplar、neighbor queue、prototype、teacher target 和 mixed branch 都在 `Z` 空间。
+- 不得随意混用 H/Z/Q。若未来做 encoder-space prototype，必须作为独立完整消融。
 
 输入混合为：
 
@@ -201,493 +289,353 @@ teacher target 和 mix 分支的空间，不能混用 H/Z/Q。
 mixed_view = beta * view_b + (1.0 - beta) * view_a[mix_index]
 ```
 
-`mixed_view` 只走：
+`mixed_view` 只走 `encoder_q -> projector_q -> normalized mixed_z`；不走 predictor，
+不进 Sinkhorn，不进 teacher，不进任何 queue。`beta` 是输入混合权重，probability target
+只在 loss 内构造并 detach，不是模型输入。
 
-```text
-encoder_q -> projector_q -> normalized mixed_z
-```
+标签使用边界：
 
-它不走 predictor，不进入 Sinkhorn，不进入 queue，不走 teacher。`beta` 是输入混合
-权重；target 只在 loss 内构造并 detach，target 不是网络输入。
-
-### 4.3 Exemplar 与标签
-
-- 每类固定选一个 exemplar，seed 为 0。
+- 每类用 seed0 固定选择一个 labeled exemplar。
 - exemplar 必须从无标签训练 loader 中排除。
-- exemplar 不得进入无标签 sampler 或被当作 queue 普通样本。
-- 标签只能用于选择固定 exemplar，以及离线/日志中的邻居 purity 诊断。
-- 标签不得进入模型、loss、queue 检索或 top-k 决策。
-- exemplar cache 会验证 class IDs、indices、seed、样本数和标签一致性；不要退回旧版
-  AimCLR 那种弱校验。
+- exemplar 不能成为普通 queue 样本。
+- 真标签只允许用于 exemplar 选择和离线/日志诊断。
+- 真标签不能进入模型输入、loss、类别 queue、top-k 或负样本修正。
 
-## 5. 已实现但尚未出结果的纯弱增强多视图原型
+## 5. 为什么提出“类别修正的 instance queue”
 
-配置：
+ReSA 的关系学习是当前 batch 上的 B×B soft assignment，每个 batch 重算，不维护用于硬
+负样本判定的持久 instance queue。AimCLR/MoCo 风格对比则使用跨 batch 的历史 queue：
 
 ```text
-config/ntu60/pretext/pretext_ose_resa_lmix_full_mv4_xsub_joint.yaml
-config/ntu60/linear_eval/linear_eval_ose_resa_lmix_full_mv4_xsub_joint.yaml
+当前 online weak query q
+配对 EMA weak key k+
+历史 EMA instance queue {k_j}, j=1...K
 ```
 
-关键参数：
+原始 InfoNCE 把 queue 中所有非配对项都视为负样本，包括真实同类别样本。这会让实例级
+目标与 OSE 的类别聚集目标拉扯共享 encoder。
 
-```yaml
-ose_topk: 0
-ose_exemplar_views: 5
-ose_exclude_exemplars: True
+新的想法不是把同类 queue 样本直接提升为正样本，而是使用 OSE 已经产生的软类别分布，
+只削弱高置信度疑似同类样本在 InfoNCE 分母中的负作用。这是保守的 false-negative
+debiasing。
+
+它与 ReSA soft weight 不同：
+
+```text
+ReSA assignment：B×B、batch-level、从无标签 H 相似度经 Sinkhorn 构造、作为软预测目标。
+类别修正权重：B×K、跨 batch、由 exemplar-anchored OSE 类别分布构造、只缩放负样本分母。
+```
+
+## 6. 下一步要实现的精确方案
+
+### 6.1 基础模型
+
+基础必须是已有最佳点：
+
+```text
+ST-GCN + ReSA Q4 + M-F
+LP200 baseline = 79.98
+```
+
+Q4 语义必须保持：
+
+```text
+ose_topk: 4
+ose_exemplar_views: 1
+ose_lambda: 1.0
 ose_mix_proto_weight: 1.0
 ose_mix_ins_weight: 1.0
 ```
 
-这里的文件名 `MV4` 指“四个额外 EMA 弱增强视图”，总组成数是五个：
+注意：本地 `pretext_ose_resa_lmix_full_xsub_joint.yaml` 当前是 Q8，不是 Q4；本地尚无
+独立的 ST-GCN Q4 M-F 配置。不要直接改写或复用 Q8 work_dir。实现时要新建名称清晰的
+Q4+queue-correction pretext/LP 配置和独立 work_dir。
+
+### 6.2 只增加双 weak 对比，不搬完整 AimCLR
+
+本实验只增加一个 MoCo 风格双 weak InfoNCE 分支：
 
 ```text
-1 个 online weak exemplar view（有梯度）
-+ 4 个 EMA weak exemplar views（no_grad）
-= 5 个 prototype components
+online weak view_a -> shared encoder_q -> independent 128-D instance projector_q -> q
+EMA weak view_b    -> shared encoder_k -> independent 128-D instance projector_k -> k+
 ```
 
-每次 `_exemplar_batch()` 都从原始 exemplar 再独立调用 feeder 的 `_aug`。当前 weak
-augmentation 是 temporal crop + shear，不包含 standard rotation。
+推荐的首版就是单向 `q(view_a)` 对 `k(view_b)`，每个 iteration 入队 `k(view_b)`。不要在
+首版自行改成双向平均或同时入队两套 key，否则会改变 loss 权重、queue 周转速度和计算语义。
 
-四个额外 EMA 视图顺序前向。为了不让这些额外前向重复改变 teacher BN buffer，
-`_teacher_exemplar_projection()` 会保存并恢复 running mean、running var 和
-`num_batches_tracked`。
+必须复用 ReSA 已经算出的 weak backbone features，不增加 ST-GCN backbone forward。
+新增的只是独立 instance projector 和 queue logits。EMA instance projector 由 online
+instance projector 初始化并随现有 momentum 机制更新。
 
-prototype 的各组成先归一化，再根据它们与 online exemplar anchor 的相似度做 softmax
-加权。当前代码不对加权和再次归一化；top-k 为 0 时不读取 queue 邻居。
+明确不加入：
 
-一个容易误解的细节：当前 ReSA 代码即使 `ose_topk: 0`，仍会把 teacher batch
-embedding 写入内部 queue；该 queue 不参与 MV4 prototype 或 ReSA loss，因此没有语义
-冲突，只产生少量无用维护开销。若以后要做“代码层面完全无 queue”的版本，可以再跳过
-enqueue，但不要把这项工程优化混进第一次 MV4 结果。
+- extreme view；
+- dropped extreme branch；
+- DDM；
+- AimCLR NNM/mining epoch；
+- AimCLR 的整套 processor。
 
-当前状态：
+### 6.3 三个严格对齐的 queue
+
+新增三个 buffer，共用一个 pointer：
 
 ```text
-实现：完成
-配置：完成
-单元测试：已添加，本地无法动态运行
-服务器 300-epoch pretext：已完成
-LP200：79.47
+instance_queue:   [128, 32768]  # 历史 EMA instance embedding
+category_queue:   [60, 32768]   # 同一历史样本的 OSE 软类别分布
+confidence_queue: [32768]       # 同一历史样本的类别置信度
+instance_queue_ptr
 ```
 
-## 6. CTR-GCN 已做的工作和当前运行状态
+同一个 slot 的 instance feature、category distribution 和 confidence 必须来自同一个样本，
+入队和 wrap-around 覆盖必须完全同步。
 
-### 6.1 公平宽度版本
-
-官方风格 10 层 CTR-GCN 默认宽度远大于本项目 AimCLR ST-GCN：
+这三个 buffer 属于新的 instance contrast 分支。它们与 ReSA+OSE 原有的 8192-D（容量）
+OSE neighbor queue 是不同用途的 queue：
 
 ```text
-官方 CTR-GCN：
-64,64,64,64,128,128,128,256,256,256
-
-本项目 ST-GCN：
-16,16,16,16,32,32,32,64,64,256
+OSE neighbor queue：给 Q4 prototype 检索 4 个邻居。
+instance queue：给 InfoNCE 提供 32768 个历史候选。
+category/confidence queue：instance queue 的语义 sidecar。
 ```
 
-`net/ctrgcn.py` 已支持显式 `layer_channels`。当前公平比较配置保留 CTR 动态图单元、
-10 层深度和 stride 位置，但把每层宽度对齐 ST-GCN：
+绝对不要合并 pointer、容量或张量，也不要让一个 queue 冒充另一个。
 
-```yaml
-num_layers: 10
-layer_channels: [16, 16, 16, 16, 32, 32, 32, 64, 64, 256]
-```
+### 6.4 类别信息来源
 
-必须准确称它为“10-layer CTR-GCN with ST-GCN-matched widths”，不要称为官方宽度
-CTR-GCN。它使用官方风格的 CTR 运算和深度/下采样结构，但宽度是我们的受控变量。
-
-对应配置：
+对当前 EMA weak key，复用 Q4 OSE 已经计算出的 teacher category target：
 
 ```text
-pretext_ose_resa_ctrgcn10_stwidth_q4_lmix_full_xsub_joint.yaml
-linear_eval_ose_resa_ctrgcn10_stwidth_q4_lmix_full_xsub_joint.yaml
+p_i in R^60, sum(p_i)=1
 ```
 
-配置锁定 Q4 M-F、weak+weak、dropout0、batch128、pretext300、LP200，用于和当前
-ST-GCN 79.98 做 backbone-only 比较。
+不要增加额外 backbone forward，不要用 ground-truth label，也不要用 hard pseudo label。
+`p_i` 在 queue correction 路径中必须 detach。
 
-### 6.2 服务器实测
+置信度使用归一化熵：
 
-用户在服务器手工把设备改为 0 后运行：
+```text
+c_i = 1 - H(p_i) / log(60)
+```
+
+- 接近 one-hot：`c_i -> 1`。
+- 接近均匀：`c_i -> 0`。
+
+### 6.5 负样本权重
+
+当前样本与第 j 个 queue 样本的类别相似度：
+
+```text
+s_ij = p_i^T p_j
+```
+
+负样本权重：
+
+```text
+w_ij = 1 - c_i * c_j * s_ij
+```
+
+所有 `p`、`c`、`w` 在该修正分支 detach：
+
+- 双方高置信且类别相同：`w_ij` 接近 0，显著削弱假负样本。
+- 类别不同：`w_ij` 接近 1。
+- 任一侧不确定：`w_ij` 接近 1，退化为原始 InfoNCE，不贸然修正。
+
+不做 hard threshold，不把同类项直接提升为 positive。
+
+### 6.6 修正后的 InfoNCE
+
+原始 logits：
+
+```text
+l_pos = q_i^T k_i+ / T
+l_neg_ij = q_i^T instance_queue_j / T
+```
+
+只修改 negative logits：
+
+```python
+negative_logits = negative_similarity / temperature
+negative_logits = negative_logits + torch.log(
+    negative_weight.clamp_min(1e-6)
+)
+```
+
+这等价于：
+
+```text
+exp(l_pos) + sum_j w_ij * exp(l_neg_ij)
+```
+
+必须先除温度，再加 `log(w)`；positive logit 不加权。`w` 不能在 temperature 之前乘到
+cosine similarity 上，那不是同一个目标。
+
+queue 初始状态：
+
+```text
+category_queue = 每列均匀 1/60
+confidence_queue = 0
+```
+
+于是初始 `w=1`，严格退化为原始 queue InfoNCE。类别修正从 epoch 1 开始，但随着 OSE
+置信度自然增强；不设置额外 hard warmup。
+
+计算当前 logits 时必须读取“入队前”的历史 queue；然后再同步写入当前 `k,p,c`。如果
+forward 内在 backward 前 enqueue，参与 logits 的 `instance_queue` 必须
+`clone().detach()`，不能只 `detach()`。
+
+### 6.7 总 loss 和日志
+
+用户明确指定新增权重为 1：
+
+```text
+Ltotal = Lcluster
+       + Lproto
+       + Lmix-proto
+       + Lmix-ins
+       + 1.0 * Lqueue-corr
+```
+
+至少记录：
+
+```text
+total
+cluster
+proto / align / disp
+mix_proto
+mix_ins
+queue_corr
+mean_category_confidence
+mean_negative_weight
+min_negative_weight
+```
+
+诊断日志不能使用真标签参与训练；若离线统计 false-negative purity，必须清楚标注为只读
+诊断，不能反馈到 loss。
+
+## 7. 实现与验证清单
+
+下一会话若获用户授权继续代码，应按以下顺序：
+
+1. 先只读审查 `net/ose_resa.py` 和 `processor/pretrain_ose_resa.py` 当前 weak feature、
+   teacher target、EMA 更新与 enqueue 顺序。
+2. 设计独立 instance projector，不改变原 ReSA/OSE projector、predictor 和 Q4 prototype。
+3. 增加 aligned instance/category/confidence buffers 和单一 pointer。
+4. 复用现有 OSE teacher target，detach 后计算 confidence 和 B×K negative weights。
+5. 实现单向 weak queue InfoNCE，权重固定为 1。
+6. 新建专用 ST-GCN Q4 M-F queue-correction pretext/LP 配置和独立 work_dir；不要改写
+   Q8、MV4 或已有 79.98 实验目录。
+7. 添加单元测试，再做静态检查。
+8. 同步服务器后先跑动态 unit test 和 1–2 iteration smoke test，确认 forward、backward、
+   EMA、queue pointer、显存和速度。
+9. 只有用户确认 GPU、预计时长、配置和 work_dir 后，才启动 pretext300；随后 LP200。
+
+必须覆盖的测试：
+
+- 三个 queue 的 slot 对齐与 pointer wrap-around。
+- category uniform/confidence0 时，修正 logits 与原始 InfoNCE 完全一致。
+- 高置信同类项权重接近 0；高置信异类项权重接近 1。
+- positive logit 不被修改。
+- `p/c/w` 无梯度，instance query/head/shared encoder 有梯度。
+- 当前 batch 不在自身 logits 计算前入队。
+- enqueue 后完整 `loss.backward()` 不触发 autograd version mismatch。
+- state_dict 保存/加载包含所有 projector、queue 和 pointer。
+- 不使用 ground-truth label。
+- backbone forward 次数不因新增 queue 分支增加。
+- 关闭 queue contrast 开关时，数值和原 ReSA Q4+M-F 路径保持一致。
+
+正式比较：
+
+```text
+R0：ReSA Q4+M-F                         = 79.98（已有）
+R2：ReSA Q4+M-F + corrected weak queue = 待跑
+```
+
+若 R2 提升，只能先说明“加入类别修正 queue 的整个分支有益”。要严格证明“修正本身”有益，
+后续仍需控制组：
+
+```text
+R1：ReSA Q4+M-F + raw weak queue（w=1）
+```
+
+比较 `R2-R1` 才能隔离 category correction 的因果贡献。当前用户决定先考虑 R2，不要未经
+确认自动增加另一场 300-epoch R1。
+
+## 8. 当前卡点
+
+1. **新的 ReSA queue-correction 分支尚未实现。** 当前只有设计，没有对应代码、配置、
+   测试或服务器结果。
+2. **本地缺少专用 ST-GCN Q4 M-F 配置。** 现有普通 `pretext_ose_resa_lmix_full...`
+   是 Q8；必须新建配置，不能原地修改造成实验身份混乱。
+3. **本地没有 torch。** 动态 backward、queue wrap 和显存测试必须在服务器执行。
+4. **AimCLR A0 结果未报告。** 约 72.56 的下降幅度无法精确量化。
+5. **CTR epoch120 LP 准确数字未记录，完整 CTR 训练又过慢。** 当前不应把它当主线。
+6. **服务器当前进程和 GPU 状态未知。** 新会话不要假设某张卡空闲。
+
+## 9. 绝对不要再踩的坑
+
+1. 不要说“top-k 越低越好”；Q0=77.22 已经反证。
+2. 不要把 Q0 单 exemplar 当成 MV4 多弱增强。
+3. 不要把新方案说成四个标量 loss；实际是五项，只有分组口径才是四组。
+4. 不要把完整 AimCLR 搬到 ReSA：首版不含 extreme、drop、DDM、NNM 或 mining。
+5. 不要擅自改成双向 InfoNCE或每步入队两套 weak key；首版是单向 q(view_a)-k(view_b)。
+6. 不要让新增 instance head 与 ReSA/OSE projector 强行共用；它是独立 128-D head。
+7. 不要增加新的 backbone forward；复用 ReSA 已经算出的 weak H/features。
+8. 不要把 OSE neighbor queue、instance queue 和 category sidecar queue 混为一谈。
+9. 不要让三个 sidecar queue 的 pointer 或覆盖位置错位。
+10. 不要用 hard pseudo label；存 60 维 soft probability 和 entropy confidence。
+11. 不要让 category weight 对 OSE 反传；`p/c/w` 必须 detach。
+12. 不要修改 positive logit；类别权重只作用于 queue negative denominator。
+13. 不要把 `w` 乘在 cosine similarity 上；正确实现是温度之后加 `log(w)`。
+14. 不要忘记 `clamp_min(1e-6)`，否则 `log(0)` 会产生无穷。
+15. 不要在计算当前 logits 前把当前 key 入队。
+16. 不要再次使用 `queue.detach()` 后原地覆盖同一存储；必须 clone 或延后 enqueue，否则
+    backward 会触发 version mismatch。
+17. 不要使用真标签修正负样本；标签只用于 exemplar 选择和只读诊断。
+18. 不要让 exemplar 回到无标签 loader、instance queue 或 OSE neighbor queue。
+19. 不要混用 H/Z/Q 空间中的 prototype、teacher target 或 mixed embedding。
+20. 不要让 mixed branch 进入 predictor、Sinkhorn、teacher 或任何 queue。
+21. 不要恢复前 20 epoch 只跑 baseline；当前协议从 epoch 1 启用所有配置目标。
+22. 不要把 warmup 当作 AimCLR 低结果的唯一解释；ReSA 从 epoch 1 启用 OSE 仍有效。
+23. 不要拿旧 LP100 约 66 与当前 LP200 结果直接比较。
+24. 不要在没有 A0 的情况下精确声称 72.56 比 baseline 下降多少。
+25. 不要混用不同 total-epoch cosine schedule 的 checkpoint。
+26. 不要复用 work_dir 覆盖 Q4=79.98、MV4=79.47 或其他旧实验。
+27. 不要把 `weights + start_epoch` 当作完整 resume；optimizer、scheduler、EMA 和 queue
+    状态可能都没有恢复。
+28. 不要把 ST-width CTR 称为官方宽度 CTR，也不要把本项目三层 CTR 称为 SCD-Net。
+29. 不要把日志暂未打印 `Iter 0 Done` 直接判为死锁；先检查 GPU、进程和分支耗时。
+30. 不要认为减少 Python forward 次数等于减少 FLOPs，也不要认为分阶段 backward 会加速。
+31. 不要直接用未同步 Sinkhorn/queue 的 DataParallel 做正式多卡实验。
+32. 不要擅自停止、删除、覆盖服务器进程、checkpoint、work_dir 或数据。
+33. 不要提交 `__pycache__`、`.pyc` 或服务器生成数据。
+34. 每次运行前重新确认 `device`；本地配置值不代表服务器空闲 GPU。
+
+## 10. 已知命令（仅供核对，不代表下一步优先级）
+
+现代 AimCLR A0：
 
 ```bash
-python main.py pretrain_ose_resa \
-  --config config/ntu60/pretext/pretext_ose_resa_ctrgcn10_stwidth_q4_lmix_full_xsub_joint.yaml
+python main.py pretrain_aimclr --config config/ntu60/pretext/pretext_aimclr_a0_xsub_joint.yaml
+python main.py linear_evaluation --config config/ntu60/linear_eval/linear_eval_aimclr_a0_xsub_joint.yaml
 ```
 
-日志确认：
-
-```text
-device: [0]
-parameters: 12.177 M
-Iter 0:  10:03:01
-Iter 100: 10:06:37
-```
-
-也就是约 216 秒/100 iter，约 2.16 秒/iter。40031 个无标签样本、batch128，
-每 epoch 约 312–313 iter，300 epochs 约 9.4 万 iter：
-
-```text
-纯迭代估计约 56.3 小时
-考虑数据、日志、存盘：约 58–62 小时
-```
-
-用户明确认为这个时长不可接受。
-
-此前“CTR 一直停在 Iter 0、后启动的 ST-GCN 已到 Iter 100”不能直接解释为死锁：
-
-- 日志只在整个 forward、backward、optimizer step 完成后打印 `Iter 0 Done`。
-- CTR 的动态关系张量比 ST-GCN 固定邻接昂贵得多。
-- 当时还可能有 GPU 设备竞争；换到 device0 后已证明能正常推进。
-
-本文不知道服务器上的 CTR 进程现在是否仍在运行。新会话第一步应只读检查进程和日志，
-不要擅自 kill、resume 或重启。
-
-本地 CTR 配置当前仍写 `device: [1]`，而服务器成功日志是手工改成 `[0]`。启动任何
-新任务前必须明确检查设备；不要直接复制本地 device 值。
-
-### 6.3 不要误解减少层数
-
-历史上做过 10/8/3 层 CTR 尝试。三层版本是本项目人为定义的
-`64 -> 128 -> 256, stride 1/2/2`，不是 SCD-Net；SCD-Net 的三层 CTR 是
-`64 -> 256 -> 64`、全 stride1，且输出时空特征给 Transformer。
-
-减少 CTR 层数会同时改变容量、感受野和下采样路径，不能再作为与 ST-GCN 的严格
-backbone-only 比较。若因预算运行，只能明确标为 depth proxy/消融，不能用来下结论
-“CTR-GCN 与 ST-GCN 谁更好”。
-
-## 7. 前向次数与速度结论
-
-当前 ReSA baseline 的 backbone 前向：
-
-```text
-online view_a
-online view_b
-teacher view_a
-teacher view_b
-= 4 次
-```
-
-因此：
-
-```text
-ReSA-only       = 4 次
-B0/Q0/Q4/Q8     = 5 次（再加 online exemplar）
-M-P/M-F         = 6 次（再加 online mixed）
-ReSA MV4 M-F    = 10 次（再加 4 个 EMA exemplar views）
-```
-
-AimCLR baseline 的 backbone 前向约为 3 次：
-
-```text
-online normal
-online extreme（drop 特征由同一次 encoder 调用返回）
-teacher key
-```
-
-所以“去掉 ReSA 换成 AimCLR 会减少前向”方向上是对的，但只少一个 baseline forward：
-
-```text
-现代 AimCLR + MV4 M-F 预计约 9 次
-ReSA + MV4 M-F 为 10 次
-```
-
-MV4 的四个额外 teacher views 才是新的主要成本。因此换 SSL baseline 不会自动让
-CTR-GCN 训练从约 60 小时变成很短。把四个视图拼 batch 可以减少 Python 调用次数，
-但不会减少总样本计算量，还会增加峰值显存。
-
-“分支算完马上 backward 并释放 activation”的方案主要解决显存，不减少 FLOPs，
-而且因重算 exemplar 可能更慢。若实现，必须做到：
-
-1. teacher 分支 no_grad，先缓存小 embedding。
-2. 分阶段对 loss 项 backward，梯度累积。
-3. 每个逻辑 iteration 只做一次 optimizer step。
-4. 每个逻辑 iteration 只做一次 EMA 更新和一次 queue 更新。
-5. 若重算 exemplar，必须防止 BN running stats 重复更新。
-6. 用同 seed 小规模比较 loss、梯度和最终 LP，不能只看能否跑通。
-
-它仍未实现，不是当前速度问题的现成解决方案。
-
-## 8. AimCLR 与 OSE 冲突的分析结论
-
-### 8.1 用户的核心理解基本正确，但表述要精确
-
-旧 AimCLR+OSE 不是同一块 queue 张量同时扮演负样本和 OSE 原型邻居：
-
-- AimCLR 有自己的 `queue` 和 projector。
-- OSE 另建 `ose_queue` 和 `ose_projector_q/k`。
-- warmup 结束时 OSE 从 AimCLR head/queue 拷贝一次，之后两者各自更新。
-
-真正的冲突是“相同来源的样本语义 + 共享 encoder 的优化目标”，不是同一 tensor 被
-两个 loss 原地拉扯。
-
-AimCLR 在 mining epoch 之前把非配对 queue 样本视为负样本；旧 OSE 同时从同一批
-无标签样本形成的另一条 queue 取 top-8，作为类别 prototype 的组成。OSE 在 epoch 21
-后启用、AimCLR 约到 epoch 150 才开始 top-1 邻居挖掘，因此 21–150 epoch 冲突最强：
-
-```text
-AimCLR：该邻居不是同一实例 -> 推远
-OSE：该邻居与某类 exemplar 相似 -> 聚入原型并拉近相关样本
-```
-
-150 epoch 后 AimCLR 只提升少量 top-1 邻居为正样本，OSE top-8 中的大部分样本仍可能
-是 AimCLR 的负样本，所以冲突只缓和、不消失。
-
-queue 张量是 detached 的，不能写成“一个 loss 直接推远存储特征，另一个直接拉近
-同一个存储特征”。梯度冲突发生在后续新样本和共享 encoder 上：
-
-```text
-AimCLR 倾向实例均匀/可分
-OSE 倾向类别聚集
-```
-
-### 8.2 纯弱增强 prototype 能解决什么
-
-若 OSE prototype 只由带标签 exemplar 的多个弱增强视图构造，不取任何无标签 queue
-邻居，就消除了最明确的矛盾：
-
-> 某个无标签样本既是 AimCLR 的负样本，又是 OSE 类别 prototype 的组成。
-
-推荐未来的干净 AimCLR+OSE：
-
-- AimCLR 保留自己的原生 queue，只服务 AimCLR。
-- OSE 不建立/读取邻居 queue。
-- OSE prototype 只来自固定 labeled exemplar 的弱增强多视图。
-- exemplar 从无标签 loader 严格排除。
-- OSE 使用独立、现代的 projector，先减少 head-level 冲突。
-- encoder 仍共享，因此实例区分与类别聚集的天然梯度差异不会完全消失。
-
-所以它是“移除 queue 身份矛盾”，不是数学上保证两种 loss 零冲突。
-
-### 8.3 为什么 ReSA 更兼容
-
-当前 ReSA 的 `Lcluster` 是 batch-level 软关系学习，不维护一个用于硬负样本判定的
-持久 queue，也不会主动把 OSE queue 邻居推远。当前持久 queue 主要只服务 OSE 原型。
-
-因此 ReSA+queue-neighbor OSE 没有 AimCLR 那种明确的硬矛盾，更可能互补：
-
-```text
-ReSA：学习当前 batch 的软关系结构
-OSE：用少量类别 exemplar 给关系空间提供类别锚点
-```
-
-但不能说完全没有冲突。ReSA 可能按主体、视角、速度等 nuisance 聚类，仍可能与
-OSE 的动作类别锚点产生梯度分歧。区别是软的、动态的，而不是硬负样本逻辑冲突。
-
-### 8.4 Q0 结果对跨 baseline 的意义
-
-ReSA 下 Q4 > Q0 说明真实实例多样性很有价值，但不能推导 AimCLR 下也一定 Q4 > MV4。
-合理的预期反而是：
-
-```text
-ReSA：Q4 可能优于纯 MV4，因为没有硬负样本冲突且有实例多样性
-AimCLR：纯 MV4 可能优于 Q4，因为移除了更强的 queue 目标冲突
-```
-
-这正是需要实验验证的 `SSL baseline × prototype source` 交互。
-
-## 9. 旧 AimCLR+OSE LP≈66 的代码审计
-
-相关文件：
-
-```text
-net/aimclr.py
-net/ose_aimclr.py
-processor/pretrain_ose_aimclr.py
-config/ntu60/pretext/pretext_ose_aimclr_xsub_joint.yaml
-config/ntu60/linear_eval/linear_eval_ose_aimclr_xsub_joint.yaml
-```
-
-不能把约 66 单独归因于理论冲突，至少有以下混杂。
-
-### 9.1 高置信度问题
-
-1. **没有排除 exemplar。**
-   旧 processor 选择每类 exemplar 后没有从无标签 loader 删除它们。exemplar 可能进入
-   AimCLR queue/OSE queue，被当负样本，或成为自己/增强版本的近邻。协议不干净。
-
-2. **旧 LP 配置默认只有 100 epoch。**
-   当前正式结果是 LP200。如果 66 没有命令行覆盖到 200，它与 79.98 不能直接比较。
-
-3. **head 和训练协议差异巨大。**
-
-   ```text
-   旧 AimCLR+OSE：feature_dim128、2-layer hidden256、queue32768、dropout0.5
-   当前 ReSA+OSE：feature_dim256、3-layer hidden2048、queue8192、dropout0
-   ```
-
-4. **所有 OSE loss 一次性打开。**
-   旧实现不能干净拆 B0、M-P、M-F，因此无法定位究竟是哪一项造成下降。
-
-5. **没有 queue sample index 和 purity 日志。**
-   无法检查旧 top-8 邻居到底有多少同类。
-
-6. **prototype 梯度路径与当前实现不同。**
-   旧 align/mix 使用 detached key prototype，另算一份 student exemplar prototype
-   主要用于 dispersion；并不等价于当前的 online anchor + detached memory 语义。
-
-7. **旧实现额外前向和 BN 处理不同。**
-   它分别计算 key exemplar、student exemplar 和 mixed branch，总计约六次 backbone
-   forward；不能拿它的效率或训练动态直接代表将来的现代实现。
-
-### 9.2 条件性风险
-
-- 旧 AimCLR/OSE enqueue 使用 `keys.device.index` 给写入位置额外加 batch offset。
-  如果单卡实际是物理/logical `cuda:1`，而不是通过 `CUDA_VISIBLE_DEVICES` 映射成
-  `cuda:0`，queue pointer 可能错位。旧 66 使用哪种设备方式需要查原日志。
-- Git 历史中旧 OSE 初版之后还有 `ose path correct`、`ose update`、`tau update`。
-  必须知道 66 checkpoint 的精确 commit，才能判断它是否包含后来修复的问题。
-- 配置中的 tau 最终调用值是 student 0.1、teacher 0.04；函数默认值曾相反，但当前
-  forward 会显式传参。不要在不知道 checkpoint commit 的情况下武断说 66 一定由
-  tau 默认值造成。
-
-结论：旧 66 只能作为“值得重新做干净实验”的线索，不能作为 queue 冲突的因果证据。
-未来不要直接修修补补复用旧 `OSEAimCLR` 得出论文结论。
-
-## 10. 当前真正卡在哪里
-
-1. **CTR-GCN 速度不可接受。**
-   10-layer、ST-width、Q4 M-F 可以跑，但预计完整 pretext 约 58–62 小时；用户不接受。
-   当前服务器进程是否仍在运行未知。
-
-2. **ReSA MV4 已有单次正式结果，但 0.51 差距尚未做多 seed。**
-   MV4=79.47，Q4=79.98。主矩阵完成前不要先花预算追这个小差距。
-
-3. **现代 AimCLR+OSE 已完成本地重构，尚缺服务器动态测试和正式结果。**
-   A0、MV4 M-F、Q4 M-F 的 pretext300/LP200 配置已添加；本地无 `torch`，不能声称
-   动态测试已经通过。
-
-4. **旧 66 的实验身份不完整。**
-   缺精确 commit、pretext checkpoint、LP epoch、设备、work_dir 和 seed。
-
-5. **计算预算与因果完整性冲突。**
-   只跑 AimCLR MV4 并与旧 66 比，无法区分 prototype source、实现修复、head 和 LP
-   schedule。至少需要现代 AimCLR baseline 和同实现下的 Q4/MV4 对照。
-
-## 11. 推荐的下一步实验顺序
-
-### P0：先检查服务器现状，不做破坏性操作
-
-只读确认：
-
-```text
-CTR 进程是否仍在运行
-当前 epoch/iter
-GPU0/GPU1 占用
-日志和 work_dir
-Q0/Q4/Q8 checkpoint、LP 配置、seed、最终日志路径
-```
-
-未经用户确认，不停止进程、不删 work_dir、不自动重启长任务。
-
-### P1：ST-GCN ReSA MV4（已完成）
-
-先用已经实现的配置：
+现代 AimCLR+OSE MV4 M-F（已得到约 72.56）：
 
 ```bash
-python main.py pretrain_ose_resa \
-  --config config/ntu60/pretext/pretext_ose_resa_lmix_full_mv4_xsub_joint.yaml
+python main.py pretrain_ose_aimclr --config config/ntu60/pretext/pretext_ose_aimclr_mv4_lmix_full_xsub_joint.yaml
+python main.py linear_evaluation --config config/ntu60/linear_eval/linear_eval_ose_aimclr_mv4_lmix_full_xsub_joint.yaml
 ```
 
-启动前把 `device` 改成用户确认的空闲卡，使用独立 work_dir。完成 pretext300 后跑
-对应 LP200。
+CTR-GCN 10-layer ST-width Q4 M-F epoch120 LP 的已知一行命令：
 
-这一步回答：
-
-```text
-同样五个 prototype components：
-1 exemplar + 4 queue neighbors（Q4，79.98）
-vs
-1 online weak + 4 EMA weak（MV4，79.47）
+```bash
+python main.py linear_evaluation --config config/ntu60/linear_eval/linear_eval_ose_resa_ctrgcn10_stwidth_q4_lmix_full_xsub_joint.yaml --weights ./data/ntu60_cs/ose_resa_ctrgcn10_stwidth_q4_lmix_full_joint/pretext/epoch120_model.pt --work_dir ./data/ntu60_cs/ose_resa_ctrgcn10_stwidth_q4_lmix_full_joint/linear_eval_epoch120
 ```
 
-结果解释：MV4 比 Q0 高 2.25、比 Q4 低 0.51。弱视图变化补回了大部分信息；真实类内
-实例目前只有小幅优势，单次结果不足以判断该优势是否稳定。
+新的 ReSA Q4+M-F+corrected queue 配置尚不存在。不要伪造可运行命令；实现并验证配置后再
+给用户正式 pretext/LP 一行命令。
 
-### P2：现代 AimCLR+OSE（实现完成，等待验证和运行）
-
-当前未提交重构已做到：
-
-1. 保持原始 AimCLR baseline 和它自己的 queue。
-2. exemplar 从无标签 loader 排除。
-3. OSE 使用独立现代 projector；不要与 AimCLR 的 128-D instance head 强行共用。
-4. MV4 在 `ose_topk: 0` 时既不读也不写 OSE queue；Q4 使用独立 OSE queue。
-5. 支持 B0、M-P、M-F 独立开关。
-6. 使用和当前 ReSA 版本一致的 mix 公式、detach 语义、温度和 exemplar seed。
-7. LP 改为正式 200 epoch，独立 work_dir。
-8. 测试锁定 AimCLR baseline 3 次、MV4 M-F 9 次 backbone forward；正式运行仍需记录显存和 iter time。
-9. 添加 loader 排除、prototype component、loss switch 和梯度路径测试。
-10. `ose_warmup_epoch: 0`，从 epoch 1 的第一个 batch 同时启用 AimCLR、Lproto 和配置的 Lmix。
-
-建议实验顺序：
-
-```text
-A0：原始 AimCLR，LP200
-A1：AimCLR + MV4 M-F，LP200
-A2：AimCLR + Q4 M-F（同一现代实现），LP200
-然后再拆 B0 / M-P / M-F
-```
-
-若预算只能先跑一个 OSE 版本，优先 A1；但不能用 A1 对旧 66 做严格因果结论。A2 是
-验证 queue conflict 的必要受控对照。
-
-最终理想矩阵：
-
-| SSL baseline | Q4 queue prototype | MV4 weak-view prototype |
-|---|---:|---:|
-| ReSA | 79.98 | 79.47 |
-| AimCLR | 待用现代实现重跑 | 待跑 |
-
-### P3：再决定 CTR
-
-有三种明确选择，必须让用户决定：
-
-1. 接受约 60 小时，完成 10-layer ST-width 严格比较。
-2. 跑较短 depth proxy，但明确不作为正式 ST-vs-CTR 结论。
-3. 暂停 CTR，把预算用于更重要的 ReSA/AimCLR × prototype source 矩阵。
-
-分阶段 backward 只在显存成为问题时实现；它不会根治 2.16 秒/iter 的计算成本。
-
-### P4：低优先级消融
-
-- Q4 下 OSE prototype 使用 encoder H 还是 projector Z。
-- MV1/MV2/MV4 的视图数量—速度—精度折中。
-- 是否完全跳过 topk0 时无用的 ReSA queue enqueue。
-- 多 seed 复验最优点。
-
-这些都应在主矩阵之后，避免同时改变太多变量。
-
-## 12. 绝对不要再踩的坑
-
-1. 不要说“top-k 越低越好”；Q0=77.22 已反证。
-2. 不要把 Q0 单 exemplar 当成 MV4 多弱增强结果。
-3. 不要把旧 AimCLR queue 和 OSE queue 说成同一个张量；冲突在共享样本语义和 encoder。
-4. 不要拿旧 LP100 的约 66 与当前 LP200 的 79.98 直接比较。
-5. 不要直接复用旧 `OSEAimCLR` 得出因果结论。
-6. 不要让 exemplar 回到无标签 loader、AimCLR queue 或 OSE neighbor queue。
-7. 不要让标签进入训练 loss、模型输入、top-k 或 queue；标签仅用于 exemplar 选择和诊断。
-8. 不要把 OSE prototype、exemplar、teacher target 混在 H/Z/Q 不同空间。
-9. 不要让 mixed branch 进入 predictor、Sinkhorn、teacher 或 queue。
-10. 不要把 probability target 当作输入混合；输入权重是 `beta`。
-11. 不要恢复 weak+standard rotation；当前正式协议是 weak+weak。
-12. 不要仅凭 purity、entropy 或 pretext loss 选择最终模型；LP200 才是主要指标。
-13. 不要混用不同 total-epoch cosine schedule 的 checkpoint。
-14. 不要复用 work_dir 覆盖旧实验。
-15. 不要把 `weights + start_epoch` 当完整 resume；optimizer、scheduler、EMA、queue 状态可能缺失。
-16. 不要把 ST-width CTR 称为官方宽度 CTR。
-17. 不要把本项目三层 CTR 称为 SCD-Net。
-18. 不要把“Iter 0 尚未打印”直接判定为死锁；先看 GPU、进程和分支计时。
-19. 不要认为减少 Python forward 调用就等于减少 FLOPs。
-20. 不要认为分阶段 backward 会加速；它主要省峰值显存，可能因重算更慢。
-21. 不要默认启用 AMP、降低 batch、Tiny CTR、CPU offload 或全量 checkpoint；这些不是
-    用户当前确认的正式协议。
-22. 不要直接使用未正确同步 Sinkhorn/queue 的 DataParallel 做多卡正式实验。
-23. 不要擅自停止、删除、覆盖服务器任务或数据。
-24. 不要提交 `__pycache__`、`.pyc` 或服务器生成数据。
-25. 本地 MV4/CTR 配置目前写 device1；服务器成功使用 device0。每次启动都重新确认。
-
-## 13. 新会话接手后的第一组动作
+## 11. 新会话接手后的第一组动作
 
 先在本地只读：
 
@@ -697,14 +645,29 @@ git log -10 --oneline
 git diff --check
 ```
 
-然后向用户报告以下三点，不要立即启动训练：
+然后完整审查：
 
 ```text
-1. 已读 handoff，当前主结果是 Q4=79.98、MV4=79.47、Q0=77.22。
-2. 现代 AimCLR+OSE 已在本地重构，尚需服务器动态测试和 A0/A1/A2 正式实验。
-3. 需要先确认服务器 CTR 进程是否仍在跑，以及下一张可用 GPU。
+net/ose_resa.py
+processor/pretrain_ose_resa.py
+tests/test_ose_resa_lmix.py
+config/ntu60/pretext/pretext_ose_resa_lmix_full_xsub_joint.yaml
 ```
 
-若用户让继续代码工作，先审查并验证当前未提交的现代 AimCLR+OSE；若用户让继续实验，
-按 A0、A1（MV4 M-F）、A2（Q4 M-F）补齐 AimCLR 行。任何完整 300-epoch 任务启动前都要
-让用户知道预计时长和使用的设备、配置、work_dir。
+向用户报告：
+
+```text
+1. 已读 handoff，已有主结果 Q4=79.98、MV4=79.47、Q0=77.22、AimCLR+MV4 M-F≈72.56。
+2. 当前决定是实现 ReSA Q4+M-F + 类别修正双 weak instance queue，新增权重为 1。
+3. 该分支目前尚未实现；会先完成代码、配置、测试和短 smoke，不会擅自启动长训练。
+```
+
+若用户授权实现，严格按第 6、7 节执行。任何完整 pretext300 启动前，都要让用户知道：
+
+```text
+使用的 GPU
+配置文件
+work_dir
+预计时长
+是否从头训练
+```

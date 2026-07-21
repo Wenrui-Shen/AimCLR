@@ -35,16 +35,33 @@ class OSEResAProcessor(PT_Processor):
             raise ValueError('ose_topk must be non-negative')
         if self.arg.ose_exemplar_views < 1:
             raise ValueError('ose_exemplar_views must be at least 1')
+        if self.arg.queue_contrast_weight < 0:
+            raise ValueError('queue_contrast_weight must be non-negative')
+        if self.arg.smoke_test_iterations < 0:
+            raise ValueError('smoke_test_iterations must be non-negative')
+        if (self.arg.smoke_test_iterations > 0 and
+                self.arg.num_epoch != 1):
+            raise ValueError(
+                'Smoke tests require --num_epoch 1 to avoid a long run')
+        if (self.arg.queue_contrast_weight > 0 and
+                not math.isclose(self.arg.queue_contrast_weight, 1.0)):
+            raise ValueError(
+                'The current protocol fixes queue_contrast_weight at 1.0')
         mix_enabled = (
             self.arg.ose_mix_proto_weight > 0 or
             self.arg.ose_mix_ins_weight > 0)
+        queue_contrast_enabled = self.arg.queue_contrast_weight > 0
         if mix_enabled and not self.arg.ose_enabled:
             raise ValueError('Lmix cannot be enabled when OSE is disabled')
+        if queue_contrast_enabled and not self.arg.ose_enabled:
+            raise ValueError(
+                'Category-corrected queue contrast requires OSE')
         if mix_enabled and self.arg.ose_mix_alpha <= 0:
             raise ValueError('ose_mix_alpha must be positive')
 
         model_args = dict(self.arg.model_args)
         model_args['ose_enabled'] = self.arg.ose_enabled
+        model_args['queue_contrast_enabled'] = queue_contrast_enabled
         self.model = self.io.load_model(
             self.arg.model, **model_args)
         self.model.apply(_weights_init)
@@ -53,8 +70,12 @@ class OSEResAProcessor(PT_Processor):
         self.model.reset_momentum_encoder()
         if not self.arg.ose_enabled:
             mode = 'ReSA-only'
+        elif mix_enabled and queue_contrast_enabled:
+            mode = 'ReSA+Lproto+Lmix+Lqueue-corr'
         elif mix_enabled:
             mode = 'ReSA+Lproto+Lmix'
+        elif queue_contrast_enabled:
+            mode = 'ReSA+Lproto+Lqueue-corr'
         else:
             mode = 'ReSA+Lproto'
         self.io.print_log('Training mode | {} | OSE {}'.format(
@@ -72,6 +93,23 @@ class OSEResAProcessor(PT_Processor):
                     self.arg.ose_topk,
                     self.arg.ose_exemplar_views,
                     self.arg.ose_exemplar_views - 1))
+        if queue_contrast_enabled:
+            self.io.print_log(
+                'Corrected weak queue | weight {:.1f} | dim {} | size {} | '
+                'temperature {:.4f}'.format(
+                    self.arg.queue_contrast_weight,
+                    self.model.instance_feature_dim,
+                    self.model.instance_queue_size,
+                    self.model.instance_temperature))
+
+    def train_log_writer(self, epoch):
+        super().train_log_writer(epoch)
+        if self.arg.queue_contrast_weight > 0:
+            for name in (
+                    'queue_corr', 'mean_category_confidence',
+                    'mean_negative_weight', 'min_negative_weight'):
+                self.train_writer.add_scalar(
+                    name, self.iter_info[name], self.global_step)
 
     def load_data(self):
         super().load_data()
@@ -360,6 +398,10 @@ class OSEResAProcessor(PT_Processor):
                     loss = (
                         loss + self.arg.ose_mix_ins_weight *
                         losses['mix_ins'])
+                if self.arg.queue_contrast_weight > 0:
+                    loss = (
+                        loss + self.arg.queue_contrast_weight *
+                        losses['queue_corr'])
 
                 selected_indices = losses[
                     'neighbor_sample_indices'].detach().cpu().numpy()
@@ -407,12 +449,29 @@ class OSEResAProcessor(PT_Processor):
                 self.iter_info['align_kl'] = losses['align_kl'].item()
                 self.iter_info['queue'] = int(losses['queue_fill'].item())
                 self.iter_info['nn_purity'] = '{:.4f}'.format(batch_purity)
+                if self.arg.queue_contrast_weight > 0:
+                    self.iter_info['queue_corr'] = (
+                        losses['queue_corr'].item())
+                    self.iter_info['mean_category_confidence'] = (
+                        losses['mean_category_confidence'].item())
+                    self.iter_info['mean_negative_weight'] = (
+                        losses['mean_negative_weight'].item())
+                    self.iter_info['min_negative_weight'] = (
+                        losses['min_negative_weight'].item())
+                    self.iter_info['instance_queue_ptr'] = int(
+                        losses['instance_queue_ptr'].item())
             self.iter_info['ema_m'] = '{:.6f}'.format(momentum)
             self.iter_info['lr'] = '{:.6f}'.format(self.lr)
             loss_values.append(loss.item())
             self.show_iter_info()
             self.meta_info['iter'] += 1
             self.train_log_writer(epoch)
+            if (self.arg.smoke_test_iterations > 0 and
+                    batch_index + 1 >= self.arg.smoke_test_iterations):
+                self.io.print_log(
+                    'Smoke test stopped after {} iterations.'.format(
+                        self.arg.smoke_test_iterations))
+                break
 
         self.epoch_info['train_mean_loss'] = np.mean(loss_values)
         self.train_writer.add_scalar(
@@ -474,4 +533,8 @@ class OSEResAProcessor(PT_Processor):
         parser.add_argument('--ose_mix_proto_weight', type=float, default=0.0)
         parser.add_argument('--ose_mix_ins_weight', type=float, default=0.0)
         parser.add_argument('--ose_mix_alpha', type=float, default=1.0)
+        parser.add_argument('--queue_contrast_weight', type=float, default=0.0)
+        parser.add_argument(
+            '--smoke_test_iterations', type=int, default=0,
+            help='stop each smoke-test epoch after this many iterations')
         return parser

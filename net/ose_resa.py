@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,12 +36,23 @@ def _build_predictor(input_dim, hidden_dim):
     )
 
 
+def _build_instance_projector(input_dim, output_dim):
+    """AimCLR-style MLP kept separate from the ReSA/OSE projector."""
+    return nn.Sequential(
+        nn.Linear(input_dim, input_dim),
+        nn.ReLU(inplace=True),
+        nn.Linear(input_dim, output_dim),
+    )
+
+
 class OSEResA(nn.Module):
     """ReSA with exemplar-guided prototype and interpolation losses."""
 
     def __init__(self, base_encoder=None, pretrain=True, feature_dim=256,
                  projector_hidden_dim=2048, projector_layers=3,
                  use_predictor=True, ose_enabled=True, queue_size=8192,
+                 queue_contrast_enabled=False, instance_feature_dim=128,
+                 instance_queue_size=32768, instance_temperature=0.07,
                  cluster_temperature=0.4, sinkhorn_temperature=0.05,
                  sinkhorn_iterations=3, in_channels=3, hidden_channels=16,
                  hidden_dim=256, num_class=60, dropout=0.5,
@@ -49,6 +62,10 @@ class OSEResA(nn.Module):
         base_encoder = import_class(base_encoder)
         self.pretrain = pretrain
         self.ose_enabled = bool(ose_enabled)
+        self.queue_contrast_enabled = bool(queue_contrast_enabled)
+        if self.queue_contrast_enabled and not self.ose_enabled:
+            raise ValueError(
+                'Category-corrected queue contrast requires OSE')
 
         self.encoder_q = base_encoder(
             in_channels=in_channels, hidden_channels=hidden_channels,
@@ -83,6 +100,37 @@ class OSEResA(nn.Module):
             self.register_buffer(
                 'queue_sample_indices',
                 torch.full((queue_size,), -1, dtype=torch.long))
+        if self.queue_contrast_enabled:
+            if int(num_class) <= 0:
+                raise ValueError('num_class must be positive')
+            self.instance_feature_dim = int(instance_feature_dim)
+            self.instance_queue_size = int(instance_queue_size)
+            self.instance_temperature = float(instance_temperature)
+            if self.instance_feature_dim <= 0:
+                raise ValueError('instance_feature_dim must be positive')
+            if self.instance_queue_size <= 0:
+                raise ValueError('instance_queue_size must be positive')
+            if self.instance_temperature <= 0:
+                raise ValueError('instance_temperature must be positive')
+
+            self.instance_projector_q = _build_instance_projector(
+                hidden_dim, self.instance_feature_dim)
+            self.instance_projector_k = _build_instance_projector(
+                hidden_dim, self.instance_feature_dim)
+            instance_queue = torch.randn(
+                self.instance_feature_dim, self.instance_queue_size)
+            self.register_buffer(
+                'instance_queue', F.normalize(instance_queue, dim=0))
+            self.register_buffer(
+                'category_queue',
+                torch.full(
+                    (num_class, self.instance_queue_size),
+                    1.0 / float(num_class)))
+            self.register_buffer(
+                'confidence_queue',
+                torch.zeros(self.instance_queue_size))
+            self.register_buffer(
+                'instance_queue_ptr', torch.zeros(1, dtype=torch.long))
         self.reset_momentum_encoder()
 
     @torch.no_grad()
@@ -97,6 +145,12 @@ class OSEResA(nn.Module):
                                     self.projector_k.parameters()):
             param_k.data.copy_(param_q.data)
             param_k.requires_grad = False
+        if self.queue_contrast_enabled:
+            for param_q, param_k in zip(
+                    self.instance_projector_q.parameters(),
+                    self.instance_projector_k.parameters()):
+                param_k.data.copy_(param_q.data)
+                param_k.requires_grad = False
 
     @torch.no_grad()
     def _momentum_update(self, momentum):
@@ -107,6 +161,12 @@ class OSEResA(nn.Module):
         for param_q, param_k in zip(self.projector_q.parameters(),
                                     self.projector_k.parameters()):
             param_k.data.mul_(momentum).add_(param_q.data, alpha=1.0 - momentum)
+        if self.queue_contrast_enabled:
+            for param_q, param_k in zip(
+                    self.instance_projector_q.parameters(),
+                    self.instance_projector_k.parameters()):
+                param_k.data.mul_(momentum).add_(
+                    param_q.data, alpha=1.0 - momentum)
 
     @torch.no_grad()
     def _sinkhorn_knopp(self, scores):
@@ -223,6 +283,113 @@ class OSEResA(nn.Module):
         self.queue_filled[0] = min(
             self.queue_size, int(self.queue_filled.item()) + count)
 
+    @staticmethod
+    def _category_confidence(category_target):
+        category_target = category_target.detach()
+        num_classes = category_target.size(1)
+        if num_classes <= 1:
+            return torch.ones(
+                category_target.size(0), device=category_target.device,
+                dtype=category_target.dtype)
+        entropy = -(
+            category_target * category_target.clamp_min(1e-12).log()
+        ).sum(dim=1)
+        return (1.0 - entropy / math.log(num_classes)).clamp(0.0, 1.0)
+
+    @torch.no_grad()
+    def _negative_weights(self, category_target):
+        category_target = category_target.detach()
+        if category_target.dim() != 2:
+            raise ValueError('Category target must have shape [N, C]')
+        if category_target.size(1) != self.category_queue.size(0):
+            raise ValueError(
+                'Category target and category queue class counts must match')
+
+        current_confidence = self._category_confidence(category_target)
+        queued_category = self.category_queue.clone().detach()
+        queued_confidence = self.confidence_queue.clone().detach()
+        category_similarity = torch.matmul(
+            category_target, queued_category)
+        negative_weight = 1.0 - (
+            current_confidence.unsqueeze(1) *
+            queued_confidence.unsqueeze(0) * category_similarity)
+        return negative_weight.clamp(0.0, 1.0), current_confidence
+
+    def _queue_contrastive_logits(self, query, positive_key,
+                                  category_target):
+        if not self.queue_contrast_enabled:
+            raise ValueError('Queue contrast is disabled')
+        query = F.normalize(query, dim=1)
+        positive_key = F.normalize(positive_key.detach(), dim=1)
+        positive_logits = torch.sum(
+            query * positive_key, dim=1, keepdim=True)
+        negative_similarity = torch.matmul(
+            query, self.instance_queue.clone().detach())
+        negative_weight, current_confidence = self._negative_weights(
+            category_target)
+
+        positive_logits = positive_logits / self.instance_temperature
+        negative_logits = negative_similarity / self.instance_temperature
+        negative_logits = negative_logits + torch.log(
+            negative_weight.clamp_min(1e-6))
+        logits = torch.cat([positive_logits, negative_logits], dim=1)
+        return logits, negative_weight, current_confidence
+
+    def _queue_contrastive_loss(self, online_features, teacher_features,
+                                category_target):
+        query = self.instance_projector_q(online_features)
+        with torch.no_grad():
+            positive_key = self.instance_projector_k(teacher_features)
+        logits, negative_weight, current_confidence = (
+            self._queue_contrastive_logits(
+                query, positive_key, category_target.detach()))
+        labels = torch.zeros(
+            logits.size(0), dtype=torch.long, device=logits.device)
+        loss = F.cross_entropy(logits, labels)
+        return (loss, positive_key.detach(), negative_weight.detach(),
+                current_confidence.detach())
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue_instance(self, keys, categories, confidence):
+        if not self.queue_contrast_enabled:
+            raise ValueError('Queue contrast is disabled')
+        keys = F.normalize(keys.detach(), dim=1)
+        categories = categories.detach()
+        confidence = confidence.detach().view(-1)
+        count = keys.size(0)
+        if (categories.dim() != 2 or categories.size(0) != count or
+                confidence.size(0) != count):
+            raise ValueError(
+                'Instance keys, categories, and confidence must align')
+        if categories.size(1) != self.category_queue.size(0):
+            raise ValueError(
+                'Enqueued categories and category queue class counts must match')
+
+        ptr = int(self.instance_queue_ptr.item())
+        if count >= self.instance_queue_size:
+            final_ptr = (ptr + count) % self.instance_queue_size
+            keys = keys[-self.instance_queue_size:]
+            categories = categories[-self.instance_queue_size:]
+            confidence = confidence[-self.instance_queue_size:]
+            count = self.instance_queue_size
+            ptr = final_ptr
+
+        first_count = min(count, self.instance_queue_size - ptr)
+        self.instance_queue[:, ptr:ptr + first_count] = (
+            keys[:first_count].t())
+        self.category_queue[:, ptr:ptr + first_count] = (
+            categories[:first_count].t())
+        self.confidence_queue[ptr:ptr + first_count] = (
+            confidence[:first_count])
+        remaining = count - first_count
+        if remaining > 0:
+            self.instance_queue[:, :remaining] = keys[first_count:].t()
+            self.category_queue[:, :remaining] = categories[first_count:].t()
+            self.confidence_queue[:remaining] = confidence[first_count:]
+
+        self.instance_queue_ptr[0] = (
+            ptr + count) % self.instance_queue_size
+
     def _online_embeddings(self, view_a, view_b):
         view_a_features = self.encoder_q.forward_features(view_a)
         view_b_features = self.encoder_q.forward_features(view_b)
@@ -239,7 +406,8 @@ class OSEResA(nn.Module):
         projections = [F.normalize(view_a_projected, dim=1),
                        F.normalize(view_b_projected, dim=1)]
         predictions = [view_a_prediction, view_b_prediction]
-        return features, projections, predictions
+        return ([view_a_features, view_b_features], features,
+                projections, predictions)
 
     def _exemplar_embedding(self, exemplar):
         return self._online_projection(exemplar)
@@ -288,7 +456,7 @@ class OSEResA(nn.Module):
             F.normalize(self.projector_k(view_a_features), dim=1),
             F.normalize(self.projector_k(view_b_features), dim=1),
         ]
-        return features, embeddings
+        return ([view_a_features, view_b_features], features, embeddings)
 
     def forward(self, view_a, view_b=None, exemplar=None,
                 momentum=0.996, ose_topk=8, ose_alpha=0.75,
@@ -314,7 +482,8 @@ class OSEResA(nn.Module):
             raise ValueError(
                 'Mixed inputs were provided while both Lmix terms are disabled')
 
-        online_h, online_z, online_q = self._online_embeddings(view_a, view_b)
+        online_raw_h, online_h, online_z, online_q = (
+            self._online_embeddings(view_a, view_b))
         if self.ose_enabled:
             if exemplar is None:
                 raise ValueError('ReSA+Lproto requires exemplar inputs')
@@ -330,7 +499,7 @@ class OSEResA(nn.Module):
                         'All exemplar views must contain the same classes')
         with torch.no_grad():
             self._momentum_update(momentum)
-            teacher_h, teacher_z = self._teacher_embeddings(
+            teacher_raw_h, teacher_h, teacher_z = self._teacher_embeddings(
                 view_a, view_b)
             if self.ose_enabled and extra_exemplar_views:
                 extra_exemplar_z = torch.stack([
@@ -388,6 +557,24 @@ class OSEResA(nn.Module):
             disp_loss = prototype_similarity.new_tensor(0.0)
         proto_loss = align_loss + disp_loss
 
+        queue_corr_loss = proto_loss.new_tensor(0.0)
+        mean_category_confidence = proto_loss.new_tensor(0.0)
+        mean_negative_weight = proto_loss.new_tensor(1.0)
+        min_negative_weight = proto_loss.new_tensor(1.0)
+        instance_key = None
+        instance_category = None
+        instance_confidence = None
+        if self.queue_contrast_enabled:
+            # The positive key is EMA view_b.  Reuse the detached OSE teacher
+            # category target for the same sample; labels never enter this path.
+            instance_category = teacher_target.detach()
+            (queue_corr_loss, instance_key, negative_weight,
+             instance_confidence) = self._queue_contrastive_loss(
+                online_raw_h[0], teacher_raw_h[1], instance_category)
+            mean_category_confidence = instance_confidence.mean()
+            mean_negative_weight = negative_weight.mean()
+            min_negative_weight = negative_weight.min()
+
         mix_proto_loss = proto_loss.new_tensor(0.0)
         mix_ins_loss = proto_loss.new_tensor(0.0)
         if compute_mix:
@@ -438,6 +625,9 @@ class OSEResA(nn.Module):
             teacher_target * teacher_target.clamp_min(1e-12).log()
         ).sum(dim=1).mean()
         self._dequeue_and_enqueue(teacher_z[0], sample_indices)
+        if self.queue_contrast_enabled:
+            self._dequeue_and_enqueue_instance(
+                instance_key, instance_category, instance_confidence)
 
         result.update({
             'proto': proto_loss,
@@ -446,9 +636,17 @@ class OSEResA(nn.Module):
             'mix': mix_proto_loss + mix_ins_loss,
             'mix_proto': mix_proto_loss,
             'mix_ins': mix_ins_loss,
+            'queue_corr': queue_corr_loss,
+            'mean_category_confidence': mean_category_confidence,
+            'mean_negative_weight': mean_negative_weight,
+            'min_negative_weight': min_negative_weight,
             'target_entropy': target_entropy,
             'align_kl': align_loss - target_entropy,
             'queue_fill': self.queue_filled.float(),
+            'instance_queue_ptr': (
+                self.instance_queue_ptr.float()
+                if self.queue_contrast_enabled
+                else proto_loss.new_tensor(0.0)),
             'neighbor_sample_indices': neighbor_sample_indices,
         })
         return result
