@@ -35,6 +35,9 @@ class OSEResAProcessor(PT_Processor):
             raise ValueError('ose_topk must be non-negative')
         if self.arg.ose_exemplar_views < 1:
             raise ValueError('ose_exemplar_views must be at least 1')
+        if self.arg.ose_prototype_stage not in (0, 1, 2, 3):
+            raise ValueError(
+                'ose_prototype_stage must be one of 0, 1, 2, 3')
         if self.arg.queue_contrast_weight < 0:
             raise ValueError('queue_contrast_weight must be non-negative')
         if self.arg.smoke_test_iterations < 0:
@@ -61,6 +64,7 @@ class OSEResAProcessor(PT_Processor):
 
         model_args = dict(self.arg.model_args)
         model_args['ose_enabled'] = self.arg.ose_enabled
+        model_args['ose_prototype_stage'] = self.arg.ose_prototype_stage
         model_args['queue_contrast_enabled'] = queue_contrast_enabled
         self.model = self.io.load_model(
             self.arg.model, **model_args)
@@ -88,8 +92,9 @@ class OSEResAProcessor(PT_Processor):
                     self.arg.ose_mix_ins_weight,
                     self.arg.ose_mix_alpha))
             self.io.print_log(
-                'OSE prototype | queue_neighbors {} | exemplar_views {} '
-                '(1 online + {} EMA)'.format(
+                'OSE prototype | stage P{} | queue_neighbors {} | '
+                'exemplar_views {} (1 online + {} EMA)'.format(
+                    self.arg.ose_prototype_stage,
                     self.arg.ose_topk,
                     self.arg.ose_exemplar_views,
                     self.arg.ose_exemplar_views - 1))
@@ -327,6 +332,10 @@ class OSEResAProcessor(PT_Processor):
                 len(self.ose_class_ids), dtype=np.int64)
             neighbor_total = np.zeros(
                 len(self.ose_class_ids), dtype=np.int64)
+            component_count_total = np.zeros(
+                len(self.ose_class_ids), dtype=np.int64)
+            component_count_batches = 0
+            overlap_rates = []
             dataset_labels = np.asarray(loader.dataset.label)
 
         for batch_index, batch in enumerate(loader):
@@ -405,6 +414,12 @@ class OSEResAProcessor(PT_Processor):
 
                 selected_indices = losses[
                     'neighbor_sample_indices'].detach().cpu().numpy()
+                component_counts = losses[
+                    'prototype_component_counts'].detach().cpu().numpy()
+                component_count_total += component_counts
+                component_count_batches += 1
+                overlap_rates.append(float(
+                    losses['neighbor_overlap_rate'].item()))
                 batch_purity = 0.0
                 if selected_indices.size > 0:
                     valid = np.logical_and(
@@ -449,6 +464,10 @@ class OSEResAProcessor(PT_Processor):
                 self.iter_info['align_kl'] = losses['align_kl'].item()
                 self.iter_info['queue'] = int(losses['queue_fill'].item())
                 self.iter_info['nn_purity'] = '{:.4f}'.format(batch_purity)
+                self.iter_info['nn_overlap'] = '{:.4f}'.format(
+                    losses['neighbor_overlap_rate'].item())
+                self.iter_info['components'] = '{:.2f}'.format(
+                    losses['prototype_component_counts'].float().mean().item())
                 if self.arg.queue_contrast_weight > 0:
                     self.iter_info['queue_corr'] = (
                         losses['queue_corr'].item())
@@ -484,12 +503,26 @@ class OSEResAProcessor(PT_Processor):
         epoch_purity = (float(neighbor_correct.sum()) / total_neighbors
                         if total_neighbors > 0 else 0.0)
         self.epoch_info['neighbor_purity'] = epoch_purity
+        mean_overlap = float(np.mean(overlap_rates)) if overlap_rates else 0.0
+        self.epoch_info['neighbor_overlap'] = mean_overlap
         self.train_writer.add_scalar('neighbor_purity', epoch_purity, epoch)
+        self.train_writer.add_scalar('neighbor_overlap', mean_overlap, epoch)
         self.show_epoch_info()
         random_purity = 1.0 / max(len(self.ose_class_ids), 1)
         self.io.print_log(
-            'OSE neighbor diagnostic | purity {:.4f} | random {:.4f}'.format(
-                epoch_purity, random_purity))
+            'OSE neighbor diagnostic | purity {:.4f} | random {:.4f} | '
+            'overlap {:.4f}'.format(
+                epoch_purity, random_purity, mean_overlap))
+        if component_count_batches > 0:
+            mean_components = (
+                component_count_total.astype(np.float64) /
+                float(component_count_batches))
+            self.io.print_log(
+                'OSE prototype components | mean {:.2f} | min {:.2f} | '
+                'max {:.2f}'.format(
+                    float(mean_components.mean()),
+                    float(mean_components.min()),
+                    float(mean_components.max())))
         details = []
         for class_index, class_id in enumerate(self.ose_class_ids):
             if neighbor_total[class_index] > 0:
@@ -523,6 +556,7 @@ class OSEResAProcessor(PT_Processor):
         parser.add_argument('--ose_exclude_exemplars', type=str2bool,
                             default=True)
         parser.add_argument('--ose_topk', type=int, default=8)
+        parser.add_argument('--ose_prototype_stage', type=int, default=0)
         parser.add_argument(
             '--ose_exemplar_views', type=int, default=1,
             help='total weak exemplar views: one online plus EMA views')

@@ -1,6 +1,6 @@
 # AimCLR / ReSA / OSE 研究交接
 
-最后更新：2026-07-22。本文面向完全没有上下文的新会话，只保留当前主线和下一步。
+最后更新：2026-07-27。本文面向完全没有上下文的新会话，只保留当前主线和下一步。
 
 ## 1. 当前任务
 
@@ -28,8 +28,13 @@
 | ReSA + OSE M-F，Q4 | **79.98** |
 | ReSA + OSE M-F，Q8 | 78.80 |
 | ReSA + OSE M-F，MV4 | 79.47 |
+| ReSA + OSE Q4 M-F + corrected instance queue | 77.44 |
 | AimCLR A0 | 75.33 |
 | AimCLR + OSE MV4 M-F | 约 72.56 |
+
+另有 10-layer CTR-GCN（ST-GCN-matched widths）在 pretext epoch190/300
+断电截断后的 LP200=76.15。该结果不是完整 backbone 对照，不能与 ST-GCN Q4=79.98
+作正式差值结论。
 
 术语：
 
@@ -52,14 +57,16 @@ alpha = 0.75
 
 ## 3. 当前代码状态
 
-- 工作区在写本文档前是干净的，当前提交：`06a00e2 AImCLR+ReSA`。
-- corrected weak instance queue 已在该提交中实现，相关文件：
-  - `net/ose_resa.py`
-  - `processor/pretrain_ose_resa.py`
-  - `tests/test_ose_resa_queue_corr.py`
-  - `config/ntu60/pretext/pretext_ose_resa_q4_lmix_full_queue_corr_xsub_joint.yaml`
-- 该分支已有早期训练日志，数值运行正常，但尚无这里记录的最终 LP 结果；服务端进程状态未知，不要擅自启动、停止或覆盖。
-- **可靠原型和 OSE-guided ReSA 尚未实现**，没有对应配置、测试或正式结果。这是当前卡点。
+- 基准提交是 `aad4b01 handoff update`；其后的当前工作区包含尚未提交的 P0-P3 实现。
+- corrected weak instance queue 已得到 LP=77.44 的负结果，对应配置已按最新实验收敛要求删除；代码仍保留但不进入 P0-P3。
+- ReSA/OSE view 已改用专用 `feeder/ose_resa_feeder.py`。默认按顺序遍历
+  `temporal_crop -> shear -> rotation`，每项对每个 view 独立以 p=0.5 触发。
+  两个无标签 view 和每个 exemplar view 都重新采样。
+- P0/P1/P2/P3 已通过 `ose_prototype_stage: 0/1/2/3` 实现；P1 为互斥邻居，
+  P2 为 alpha-consistent aggregation，P3 为最终 prototype normalization。
+- 当前只保留 P0-P3 各自的 pretext/LP 配置；旧 ReSA-only、CTR、MV4、
+  corrected queue 和 OSE+AimCLR 配置已经删除。原始 AimCLR 代码与原始 AimCLR 配置未修改。
+- OSE-guided Semantic ReSA 尚未实现。
 
 重要表示空间：
 
@@ -84,8 +91,11 @@ Q = predictor output；用于 ReSA 跨视图预测
 alpha score 只用于选择
 raw anchor similarity 用于五个 component 的 softmax 聚合
 聚合后不重新归一化
-LP = 79.98
+历史 weak+weak 协议 LP = 79.98
 ```
+
+注意：新 P0 已统一改为三项增强逐项 p=0.5，因此它是新的增强协议基线，必须重新从头
+pretext300 + LP200；不能把历史 weak+weak 的 79.98 直接写成新 P0 的结果。
 
 #### P1：互斥邻居分配
 
@@ -182,12 +192,14 @@ L_rival = mean_c tau_r * logsumexp_{d != c}(sim(p_c,p_d) / tau_r)
 
 下一会话先做：
 
-1. `git status --short`、`git log -5 --oneline`、`git diff --check`。
-2. 完整审查 `net/ose_resa.py` 的 `_class_prototypes`、Sinkhorn、teacher target 和 enqueue 顺序。
-3. **只实现 P1**，增加独立开关、测试和专用 work_dir；验证后再做 P2，不能一次实现 P1–P3。
-4. 关闭新开关时必须数值退化为现有 Q4 M-F。
-5. 本地若无 torch，只做语法/静态检查；动态 forward/backward/queue 测试必须在服务器环境运行。
-6. 未经用户确认 GPU、配置、work_dir、预计时长和是否从头训练，不启动 pretext300。
+1. `git status --short`、`git diff --check`，复核当前未提交实现。
+2. 在有 torch 的服务器运行
+   `python -m unittest tests.test_ose_resa_prototypes tests.test_ose_resa_lmix tests.test_ose_resa_queue_corr`。
+3. 先用 P0/P1/P2/P3 各做相同 seed 的短 smoke，检查 forward/backward/queue、
+   component count 和 overlap 日志；短跑只排错。
+4. 动态测试通过后，从头运行新增强协议的 P0 pretext300 + LP200，建立新基线；
+   再按 P1、P2、P3 顺序运行，不能沿用历史79.98作为新 P0。
+5. 未经用户确认 GPU、配置、work_dir 和预计时长，不启动正式训练。
 
 测试至少覆盖：
 
@@ -203,10 +215,11 @@ L_rival = mean_c tau_r * logsumexp_{d != c}(sim(p_c,p_d) / tau_r)
 1. 不要把每类一个带标签 exemplar 的设置称为“完全无监督”；应称 one-shot-assisted / label-efficient self-supervised learning。
 2. 不要说“Top-K 越小越好”：Q0=77.22 已反证；也不要把 Q4>Q8 直接等同于更高纯度。
 3. 用户明确否决置信度设计：不要再加入 entropy confidence、JS confidence、阈值、置信度 queue 或基于置信度的动态 K。
-4. 不要把 corrected/raw instance queue 合并回论文主线；ReSA 原生 BxB 关系应直接被 OSE 修正。
-5. 不要一次改变邻居分配、聚合、归一化和 Sinkhorn；严格按 P1→P2→P3 和 2x2 消融。
+4. 不要把 corrected/raw instance queue 合并回论文主线；其 LP=77.44，且 ReSA 原生 BxB 关系应直接被 OSE 修正。
+5. 正式实验不要合并比较邻居分配、聚合、归一化和 Sinkhorn；虽然 P0-P3 已用累计 stage
+   实现，结果仍须严格按 P1-P0、P2-P1、P3-P2 和后续 2x2 消融归因。
 6. 不要混用 online/EMA、H/Z/Q；P4 的 teacher prototype 和 `disp` 梯度语义没有设计清楚前不要动。
-7. 不要复用或覆盖已有 Q4=79.98、Q0、Q8、MV4、AimCLR work_dir；每个实验使用独立配置和目录。
+7. 不要复用或覆盖已有 Q4=79.98、Q0、Q8、MV4、AimCLR work_dir；新 P0-P3 已使用独立配置和目录。
 8. 不要混比不同 total-epoch cosine schedule 的同名 checkpoint；短跑只能排错，不能当论文结论。
 9. 不要把 `weights + start_epoch` 当完整 resume；optimizer、scheduler、EMA、queue 未恢复会改变实验。
 10. ground-truth label 只允许 exemplar 选择和离线诊断，绝不能进入 loss、Top-K、matching 或 Sinkhorn 修正。
@@ -214,4 +227,7 @@ L_rival = mean_c tau_r * logsumexp_{d != c}(sim(p_c,p_d) / tau_r)
 
 ## 7. 当前交接点
 
-研究方案已经确定到“可靠 Q4 原型 + OSE soft relation 改进 ReSA”，且明确不使用置信度。代码尚未开始实现 P1/P2/P3/semantic ReSA。下一步应从 **P1 互斥邻居分配**开始，先完成代码、单元测试和短 smoke；不要直接启动完整训练。
+研究方案已经确定到“可靠 Q4 原型 + OSE soft relation 改进 ReSA”，且明确不使用置信度。
+三项逐项 p=0.5 的 ReSA/OSE 专用增强以及 P0-P3 已实现并配好独立目录，本地静态编译通过；
+本机缺少 torch，动态测试仍需在服务器执行。下一步是服务器单元测试和四阶段短 smoke，
+然后先从头建立新增强协议的 P0 正式基线。Semantic ReSA 尚未实现。

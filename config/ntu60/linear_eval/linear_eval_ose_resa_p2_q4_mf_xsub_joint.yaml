@@ -1,9 +1,7 @@
-work_dir: ./data/ntu60_cs/ose_resa_weak_dropout0_joint/linear_eval
-
-weights: ./data/ntu60_cs/ose_resa_weak_dropout0_joint/pretext/epoch300_model.pt
+work_dir: ./data/ntu60_cs/ose_resa_p2_q4_mf_probaug_joint/linear_eval
+weights: ./data/ntu60_cs/ose_resa_p2_q4_mf_probaug_joint/pretext/epoch300_model.pt
 ignore_weights: [encoder_q.fc, encoder_k, projector_q, projector_k, predictor, queue]
 
-# feeder
 train_feeder: feeder.ntu_feeder.Feeder_single
 train_feeder_args:
   data_path: ../data/pstl/xsub/train_position.npy
@@ -19,7 +17,6 @@ test_feeder_args:
   temperal_padding_ratio: -1
   mmap: True
 
-# model
 model: net.aimclr.AimCLR
 model_args:
   base_encoder: net.st_gcn.Model
@@ -34,20 +31,15 @@ model_args:
     strategy: 'spatial'
   edge_importance_weighting: True
 
-# optimizer
 nesterov: False
 weight_decay: 0.0
 base_lr: 3.
 optimizer: SGD
 step: [80]
-
-# training
 device: [0]
 batch_size: 128
 test_batch_size: 128
 num_epoch: 200
 stream: 'joint'
-
-# log
 save_interval: -1
 eval_interval: 5

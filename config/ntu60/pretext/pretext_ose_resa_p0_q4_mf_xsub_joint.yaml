@@ -1,20 +1,21 @@
-work_dir: ./data/ntu60_cs/ose_resa_ctrgcn_b0_joint/pretext
+work_dir: ./data/ntu60_cs/ose_resa_p0_q4_mf_probaug_joint/pretext
 
-# feeder
-train_feeder: feeder.ntu_feeder.Feeder_double
+# ReSA/OSE-only probabilistic view construction.  Each method is visited in
+# order and independently applied with probability 0.5 for every view.
+train_feeder: feeder.ose_resa_feeder.Feeder
 train_feeder_args:
   data_path: ../data/pstl/xsub/train_position.npy
   label_path: ../data/pstl/xsub/train_label.pkl
   shear_amplitude: 0.5
   temperal_padding_ratio: 6
-  second_view: weak
+  augmentation_methods: [temporal_crop, shear, rotation]
+  augmentation_probability: 0.5
   mmap: True
   return_index: True
 
-# model
 model: net.ose_resa.OSEResA
 model_args:
-  base_encoder: net.ctrgcn.Model
+  base_encoder: net.st_gcn.Model
   pretrain: True
   feature_dim: 256
   projector_hidden_dim: 2048
@@ -25,19 +26,15 @@ model_args:
   sinkhorn_temperature: 0.05
   sinkhorn_iterations: 3
   in_channels: 3
-  hidden_channels: 64
+  hidden_channels: 16
   hidden_dim: 256
   num_class: 60
   dropout: 0.0
-  num_point: 25
-  num_person: 2
-  adaptive: True
   graph_args:
     layout: 'ntu-rgb+d'
     strategy: 'spatial'
   edge_importance_weighting: True
 
-# Keep the ReSA/OSE optimizer and schedule identical to the ST-GCN baseline.
 nesterov: False
 weight_decay: 1e-5
 base_lr: 0.25
@@ -46,29 +43,32 @@ resa_warmup_epoch: 2
 resa_momentum: 0.996
 optimizer: SGD
 
-# training
-device: [1]
+# Confirm the free server GPU before a formal run.
+device: [0]
 batch_size: 128
 test_batch_size: 128
 num_epoch: 300
 start_epoch: 0
 stream: 'joint'
 
-# B0: ReSA + Lproto, with only the backbone changed.
+# P0: independent per-class Top-4, raw-anchor-similarity aggregation, no
+# final prototype normalization.  M-F = Lmix-proto + Lmix-ins.
 ose_enabled: True
 ose_num_class: 60
 ose_exemplar_seed: 0
-ose_exemplar_index_path: ./data/ntu60_cs/ose_resa_weak_dropout0_joint/exemplar_seed0.npy
+ose_exemplar_index_path: ./data/ntu60_cs/ose_resa_shared/exemplar_seed0.npy
 ose_exclude_exemplars: True
-ose_topk: 8
+ose_topk: 4
+ose_prototype_stage: 0
+ose_exemplar_views: 1
 ose_alpha: 0.75
 ose_tau_s: 0.1
 ose_tau_t: 0.04
 ose_lambda: 1.0
-ose_mix_proto_weight: 0.0
-ose_mix_ins_weight: 0.0
+ose_mix_proto_weight: 1.0
+ose_mix_ins_weight: 1.0
 ose_mix_alpha: 1.0
+queue_contrast_weight: 0.0
 
-# log
 save_interval: 5
 eval_interval: -1

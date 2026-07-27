@@ -1,17 +1,16 @@
-work_dir: ./data/ntu60_cs/ose_resa_q4_lmix_full_queue_corr_weak_dropout0_300ep_joint/pretext
+work_dir: ./data/ntu60_cs/ose_resa_p1_q4_mf_probaug_joint/pretext
 
-# feeder
-train_feeder: feeder.ntu_feeder.Feeder_double
+train_feeder: feeder.ose_resa_feeder.Feeder
 train_feeder_args:
   data_path: ../data/pstl/xsub/train_position.npy
   label_path: ../data/pstl/xsub/train_label.pkl
   shear_amplitude: 0.5
   temperal_padding_ratio: 6
-  second_view: weak
+  augmentation_methods: [temporal_crop, shear, rotation]
+  augmentation_probability: 0.5
   mmap: True
   return_index: True
 
-# model
 model: net.ose_resa.OSEResA
 model_args:
   base_encoder: net.st_gcn.Model
@@ -24,11 +23,6 @@ model_args:
   cluster_temperature: 0.4
   sinkhorn_temperature: 0.05
   sinkhorn_iterations: 3
-  # Independent one-way weak instance branch: q(view_a) -> k(view_b).
-  queue_contrast_enabled: True
-  instance_feature_dim: 128
-  instance_queue_size: 32768
-  instance_temperature: 0.07
   in_channels: 3
   hidden_channels: 16
   hidden_dim: 256
@@ -39,7 +33,6 @@ model_args:
     strategy: 'spatial'
   edge_importance_weighting: True
 
-# optimizer and ReSA schedule
 nesterov: False
 weight_decay: 1e-5
 base_lr: 0.25
@@ -48,22 +41,21 @@ resa_warmup_epoch: 2
 resa_momentum: 0.996
 optimizer: SGD
 
-# training
-# Confirm the currently free server GPU before starting a formal run.
-device: [1]
+device: [0]
 batch_size: 128
 test_batch_size: 128
 num_epoch: 300
 start_epoch: 0
 stream: 'joint'
 
-# Locked ReSA Q4 + OSE M-F protocol.
+# P1 = P0 + mutually exclusive queue-neighbor assignment.
 ose_enabled: True
 ose_num_class: 60
 ose_exemplar_seed: 0
-ose_exemplar_index_path: ./data/ntu60_cs/ose_resa_weak_dropout0_joint/exemplar_seed0.npy
+ose_exemplar_index_path: ./data/ntu60_cs/ose_resa_shared/exemplar_seed0.npy
 ose_exclude_exemplars: True
 ose_topk: 4
+ose_prototype_stage: 1
 ose_exemplar_views: 1
 ose_alpha: 0.75
 ose_tau_s: 0.1
@@ -72,10 +64,7 @@ ose_lambda: 1.0
 ose_mix_proto_weight: 1.0
 ose_mix_ins_weight: 1.0
 ose_mix_alpha: 1.0
+queue_contrast_weight: 0.0
 
-# Fifth scalar objective: category-corrected weak queue InfoNCE.
-queue_contrast_weight: 1.0
-
-# log
 save_interval: 5
 eval_interval: -1

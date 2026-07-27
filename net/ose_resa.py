@@ -56,12 +56,16 @@ class OSEResA(nn.Module):
                  cluster_temperature=0.4, sinkhorn_temperature=0.05,
                  sinkhorn_iterations=3, in_channels=3, hidden_channels=16,
                  hidden_dim=256, num_class=60, dropout=0.5,
+                 ose_prototype_stage=0,
                  graph_args={'layout': 'ntu-rgb+d', 'strategy': 'spatial'},
                  edge_importance_weighting=True, **kwargs):
         super().__init__()
         base_encoder = import_class(base_encoder)
         self.pretrain = pretrain
         self.ose_enabled = bool(ose_enabled)
+        self.ose_prototype_stage = int(ose_prototype_stage)
+        if self.ose_prototype_stage not in (0, 1, 2, 3):
+            raise ValueError('ose_prototype_stage must be one of 0, 1, 2, 3')
         self.queue_contrast_enabled = bool(queue_contrast_enabled)
         if self.queue_contrast_enabled and not self.ose_enabled:
             raise ValueError(
@@ -189,6 +193,23 @@ class OSEResA(nn.Module):
     def _soft_cross_entropy(logits, target):
         return -(target * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
 
+    @staticmethod
+    def _component_competition_scores(exemplar_z, components, class_index,
+                                      alpha):
+        similarity = torch.matmul(exemplar_z, components.t())
+        class_similarity = similarity[class_index]
+        if exemplar_z.size(0) > 1:
+            other_mask = torch.ones(
+                exemplar_z.size(0), dtype=torch.bool,
+                device=exemplar_z.device)
+            other_mask[class_index] = False
+            max_other = similarity[other_mask].max(dim=0)[0]
+        else:
+            max_other = torch.zeros_like(class_similarity)
+        return (
+            float(alpha) * class_similarity -
+            (1.0 - float(alpha)) * max_other)
+
     def _class_prototypes(self, exemplar_z, topk, alpha,
                           extra_exemplar_z=None):
         exemplar_z = F.normalize(exemplar_z, dim=1)
@@ -207,6 +228,7 @@ class OSEResA(nn.Module):
         filled = int(self.queue_filled.item())
         neighbor_count = min(max(int(topk), 0), filled)
         neighbor_indices = None
+        neighbor_valid = None
         memory = None
         if neighbor_count > 0:
             memory = F.normalize(
@@ -227,30 +249,93 @@ class OSEResA(nn.Module):
             score = (
                 float(alpha) * similarity -
                 (1.0 - float(alpha)) * max_other)
-            neighbor_indices = torch.topk(
-                score, k=neighbor_count, dim=1).indices
-            neighbor_sample_indices = self.queue_sample_indices[
-                :filled][neighbor_indices].detach()
+            if self.ose_prototype_stage == 0:
+                neighbor_indices = torch.topk(
+                    score, k=neighbor_count, dim=1).indices
+                neighbor_valid = torch.ones_like(
+                    neighbor_indices, dtype=torch.bool)
+            else:
+                # P1+: each queue slot is owned by exactly one class before
+                # per-class Top-K.  Missing candidates stay padded with -1.
+                owner = score.argmax(dim=0)
+                neighbor_indices = torch.full(
+                    (exemplar_z.size(0), neighbor_count), -1,
+                    dtype=torch.long, device=exemplar_z.device)
+                neighbor_valid = torch.zeros_like(
+                    neighbor_indices, dtype=torch.bool)
+                for class_index in range(exemplar_z.size(0)):
+                    candidates = torch.nonzero(
+                        owner == class_index, as_tuple=False).flatten()
+                    selected_count = min(
+                        neighbor_count, int(candidates.numel()))
+                    if selected_count == 0:
+                        continue
+                    selected_in_candidates = torch.topk(
+                        score[class_index, candidates],
+                        k=selected_count).indices
+                    selected = candidates[selected_in_candidates]
+                    neighbor_indices[
+                        class_index, :selected_count] = selected
+                    neighbor_valid[
+                        class_index, :selected_count] = True
+
+            neighbor_sample_indices = torch.full_like(
+                neighbor_indices, -1)
+            neighbor_sample_indices[neighbor_valid] = (
+                self.queue_sample_indices[:filled][
+                    neighbor_indices[neighbor_valid]])
+            neighbor_sample_indices = neighbor_sample_indices.detach()
         else:
             neighbor_sample_indices = torch.empty(
                 exemplar_z.size(0), 0, dtype=torch.long,
                 device=exemplar_z.device)
+            neighbor_valid = torch.empty(
+                exemplar_z.size(0), 0, dtype=torch.bool,
+                device=exemplar_z.device)
 
         prototypes = []
+        component_counts = []
         for class_index in range(exemplar_z.size(0)):
             component_groups = [
                 exemplar_z[class_index:class_index + 1]]
             if extra_exemplar_z is not None:
                 component_groups.append(extra_exemplar_z[class_index])
             if neighbor_count > 0:
-                component_groups.append(
-                    memory[neighbor_indices[class_index]])
+                selected = neighbor_indices[class_index][
+                    neighbor_valid[class_index]]
+                if selected.numel() > 0:
+                    component_groups.append(memory[selected])
             components = torch.cat(component_groups, dim=0)
-            weights = torch.softmax(
-                torch.matmul(components, exemplar_z[class_index]), dim=0)
-            prototypes.append(
-                torch.sum(weights.unsqueeze(1) * components, dim=0))
-        return torch.stack(prototypes, dim=0), neighbor_sample_indices
+            if self.ose_prototype_stage >= 2:
+                aggregation_scores = self._component_competition_scores(
+                    exemplar_z, components, class_index, alpha)
+            else:
+                aggregation_scores = torch.matmul(
+                    components, exemplar_z[class_index])
+            weights = torch.softmax(aggregation_scores, dim=0)
+            prototype = torch.sum(
+                weights.unsqueeze(1) * components, dim=0)
+            if self.ose_prototype_stage >= 3:
+                prototype = F.normalize(prototype, dim=0)
+            prototypes.append(prototype)
+            component_counts.append(components.size(0))
+
+        valid_queue_indices = (
+            neighbor_indices[neighbor_valid]
+            if neighbor_indices is not None
+            else torch.empty(
+                0, dtype=torch.long, device=exemplar_z.device))
+        if valid_queue_indices.numel() > 0:
+            unique_count = torch.unique(valid_queue_indices).numel()
+            overlap_rate = valid_queue_indices.new_tensor(
+                1.0 - float(unique_count) /
+                float(valid_queue_indices.numel()), dtype=exemplar_z.dtype)
+        else:
+            overlap_rate = exemplar_z.new_tensor(0.0)
+        component_counts = torch.tensor(
+            component_counts, dtype=torch.long, device=exemplar_z.device)
+        return (torch.stack(prototypes, dim=0), neighbor_sample_indices,
+                component_counts, overlap_rate)
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys, sample_indices=None):
@@ -536,9 +621,10 @@ class OSEResA(nn.Module):
         if not self.ose_enabled:
             return result
 
-        prototypes, neighbor_sample_indices = self._class_prototypes(
-            exemplar_z, topk=ose_topk, alpha=ose_alpha,
-            extra_exemplar_z=extra_exemplar_z)
+        (prototypes, neighbor_sample_indices, prototype_component_counts,
+         neighbor_overlap_rate) = self._class_prototypes(
+             exemplar_z, topk=ose_topk, alpha=ose_alpha,
+             extra_exemplar_z=extra_exemplar_z)
         student_logits = torch.matmul(
             online_z[1], prototypes.t()) / max(float(ose_tau_s), 1e-12)
         teacher_logits = torch.matmul(
@@ -648,5 +734,7 @@ class OSEResA(nn.Module):
                 if self.queue_contrast_enabled
                 else proto_loss.new_tensor(0.0)),
             'neighbor_sample_indices': neighbor_sample_indices,
+            'prototype_component_counts': prototype_component_counts,
+            'neighbor_overlap_rate': neighbor_overlap_rate,
         })
         return result
