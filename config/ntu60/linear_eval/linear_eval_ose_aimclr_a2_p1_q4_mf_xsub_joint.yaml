@@ -1,6 +1,7 @@
-work_dir: ./data/ntu60_cs/ose_resa_p1_q4_mf_probaug_joint/linear_eval
-weights: ./data/ntu60_cs/ose_resa_p1_q4_mf_probaug_joint/pretext/epoch300_model.pt
-ignore_weights: [encoder_q.fc, encoder_k, projector_q, projector_k, predictor, queue]
+work_dir: ./data/ntu60_cs/ose_aimclr_a2_p1_q4_mf_constrained_nnm_joint/linear_eval
+
+weights: ./data/ntu60_cs/ose_aimclr_a2_p1_q4_mf_constrained_nnm_joint/pretext/epoch300_model.pt
+ignore_weights: [encoder_q.fc, encoder_k, queue, queue_ptr, queue_filled, queue_sample_indices]
 
 train_feeder: feeder.ntu_feeder.Feeder_single
 train_feeder_args:
@@ -36,10 +37,12 @@ weight_decay: 0.0
 base_lr: 3.
 optimizer: SGD
 step: [80]
+
 device: [0]
 batch_size: 128
 test_batch_size: 128
 num_epoch: 200
 stream: 'joint'
+
 save_interval: -1
 eval_interval: 5

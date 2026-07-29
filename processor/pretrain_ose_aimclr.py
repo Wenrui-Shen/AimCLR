@@ -23,7 +23,7 @@ def _weights_init(module):
 
 
 class OSEAimCLR_Processor(AimCLR_Processor):
-    """AimCLR pretraining with clean, independently switchable OSE losses."""
+    """AimCLR A2 with shared-queue P1 prototypes and constrained NNM."""
 
     def load_model(self):
         if self.arg.ose_enabled and len(self.arg.device) != 1:
@@ -46,8 +46,6 @@ class OSEAimCLR_Processor(AimCLR_Processor):
             raise ValueError('ose_topk must be non-negative')
         if self.arg.ose_exemplar_views < 1:
             raise ValueError('ose_exemplar_views must be at least 1')
-        if self.arg.ose_warmup_epoch < 0:
-            raise ValueError('ose_warmup_epoch must be non-negative')
         if self.arg.ose_lambda < 0:
             raise ValueError('ose_lambda must be non-negative')
         if self.arg.ose_tau_s <= 0 or self.arg.ose_tau_t <= 0:
@@ -68,18 +66,17 @@ class OSEAimCLR_Processor(AimCLR_Processor):
         self.model.apply(_weights_init)
         self.loss = nn.CrossEntropyLoss()
         self.re_criterion = nn.L1Loss(reduction='none')
-        if self.arg.ose_enabled:
-            self.model.reset_ose_momentum_projector()
+        self.model.reset_momentum_encoder()
 
         if not self.arg.ose_enabled:
             mode = 'AimCLR-only (A0)'
-        elif not mix_enabled:
-            mode = 'AimCLR+Lproto (B0)'
         elif (self.arg.ose_mix_proto_weight > 0 and
               self.arg.ose_mix_ins_weight > 0):
-            mode = 'AimCLR+Lproto+Lmix-proto+Lmix-ins (M-F)'
+            mode = 'A2: AimCLR+P1-proto+M-F+OSE-constrained-NNM'
+        elif not mix_enabled:
+            mode = 'AimCLR+shared-queue-P1-proto'
         else:
-            mode = 'AimCLR+Lproto+partial-Lmix'
+            mode = 'AimCLR+shared-queue-P1-proto+partial-A2'
         self.io.print_log('Training mode | {}'.format(mode))
         if self.arg.ose_enabled:
             self.io.print_log(
@@ -89,9 +86,12 @@ class OSEAimCLR_Processor(AimCLR_Processor):
                     self.arg.ose_mix_ins_weight,
                     self.arg.ose_mix_alpha))
             self.io.print_log(
-                'OSE prototype | queue_neighbors {} | exemplar_views {} '
-                '(1 online + {} EMA)'.format(
+                'OSE A2 | shared_queue True | mutually_exclusive True | '
+                'queue_neighbors {} | constrained_positive_max 1 | '
+                'activation epoch>{} | '
+                'exemplar_views {} (1 online + {} EMA)'.format(
                     self.arg.ose_topk,
+                    self.arg.mining_epoch,
                     self.arg.ose_exemplar_views,
                     self.arg.ose_exemplar_views - 1))
 
@@ -265,7 +265,7 @@ class OSEAimCLR_Processor(AimCLR_Processor):
         ]
 
     def _ose_active(self, epoch):
-        return self.arg.ose_enabled and epoch > self.arg.ose_warmup_epoch
+        return self.arg.ose_enabled and epoch > self.arg.mining_epoch
 
     def train(self, epoch):
         self.model.train()
@@ -293,12 +293,14 @@ class OSEAimCLR_Processor(AimCLR_Processor):
                 data3.float().to(self.dev, non_blocking=True))
 
             compute_ose = self._ose_active(epoch)
-            if compute_ose:
+            if self.arg.ose_enabled:
                 if sample_indices is None:
                     raise ValueError(
-                        'Active OSE training requires sample indices')
+                        'AimCLR A2 requires sample indices for its shared '
+                        'queue sidecar')
                 sample_indices = sample_indices.long().to(
                     self.dev, non_blocking=True)
+            if compute_ose:
                 exemplar_views = self._exemplar_batches()
                 exemplar = exemplar_views[0]
             else:
@@ -341,7 +343,7 @@ class OSEAimCLR_Processor(AimCLR_Processor):
                 self.model, 'module') else self.model
             model.update_ptr(output1.size(0))
 
-            if nnm:
+            if target1.dim() == 2:
                 loss1 = -(
                     F.log_softmax(output1, dim=1) * target1
                 ).sum(1) / target1.sum(1)
@@ -364,7 +366,11 @@ class OSEAimCLR_Processor(AimCLR_Processor):
             target_entropy = zero
             align_kl = zero
             queue_fill = 0
-            prototype_components = 0
+            prototype_components = zero
+            neighbor_overlap = zero
+            nnm_positive_rate = zero
+            nnm_candidate_count = zero
+            nnm_same_sample_filtered = zero
             batch_purity = 0.0
             if ose_losses is not None:
                 proto_loss = ose_losses['proto']
@@ -375,8 +381,13 @@ class OSEAimCLR_Processor(AimCLR_Processor):
                 target_entropy = ose_losses['target_entropy']
                 align_kl = ose_losses['align_kl']
                 queue_fill = int(ose_losses['queue_fill'].item())
-                prototype_components = int(
-                    ose_losses['prototype_components'].item())
+                prototype_components = ose_losses[
+                    'prototype_component_counts'].float()
+                neighbor_overlap = ose_losses['neighbor_overlap_rate']
+                nnm_positive_rate = ose_losses['nnm_positive_rate']
+                nnm_candidate_count = ose_losses['nnm_candidate_count']
+                nnm_same_sample_filtered = ose_losses[
+                    'nnm_same_sample_filtered']
                 loss = loss + self.arg.ose_lambda * proto_loss
                 if compute_mix_proto:
                     loss = (
@@ -423,7 +434,17 @@ class OSEAimCLR_Processor(AimCLR_Processor):
             self.iter_info['target_h'] = target_entropy.item()
             self.iter_info['align_kl'] = align_kl.item()
             self.iter_info['queue'] = queue_fill
-            self.iter_info['components'] = prototype_components
+            self.iter_info['components'] = (
+                '{:.2f}'.format(prototype_components.mean().item())
+                if prototype_components.numel() > 0 else '0.00')
+            self.iter_info['nn_overlap'] = '{:.4f}'.format(
+                neighbor_overlap.item())
+            self.iter_info['nnm_pos_rate'] = '{:.4f}'.format(
+                nnm_positive_rate.item())
+            self.iter_info['nnm_candidates'] = '{:.2f}'.format(
+                nnm_candidate_count.item())
+            self.iter_info['same_filtered'] = '{:.0f}'.format(
+                nnm_same_sample_filtered.item())
             self.iter_info['nn_purity'] = '{:.4f}'.format(batch_purity)
             self.iter_info['ose'] = int(compute_ose)
             self.iter_info['lr'] = '{:.6f}'.format(self.lr)
@@ -477,8 +498,7 @@ class OSEAimCLR_Processor(AimCLR_Processor):
         parser.add_argument('--ose_exemplar_index_path', type=str, default='')
         parser.add_argument('--ose_exclude_exemplars', type=str2bool,
                             default=True)
-        parser.add_argument('--ose_warmup_epoch', type=int, default=0)
-        parser.add_argument('--ose_topk', type=int, default=8)
+        parser.add_argument('--ose_topk', type=int, default=4)
         parser.add_argument(
             '--ose_exemplar_views', type=int, default=1,
             help='total weak exemplar views: one online plus EMA views')

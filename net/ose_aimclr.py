@@ -1,28 +1,30 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 from .aimclr import AimCLR
-from .ose_resa import _build_projector
 
 
 class OSEAimCLR(AimCLR):
-    """AimCLR with an independent modern projection space for OSE.
+    """AimCLR A2 with OSE prototypes and one shared feature queue.
 
-    AimCLR retains its native instance head and negative queue.  OSE operates
-    only on encoder features through its own online/EMA projectors and, when
-    requested, its own neighbor queue.  This separation is important: the two
-    objectives share the backbone, but no head or stored tensor has two roles.
+    The native AimCLR embedding is used for instance contrast, exemplars,
+    mutually exclusive P1 neighbors, prototypes, and interpolation losses.
+    After mining starts, OSE first selects one semantic P1 pool and AimCLR's
+    three query views choose at most one extra positive inside that pool.  No
+    soft-positive weight, second projector, or second feature queue is used.
     """
 
     def __init__(self, base_encoder=None, pretrain=True, feature_dim=128,
-                 queue_size=32768, momentum=0.999, Temperature=0.07, mlp=True,
-                 in_channels=3, hidden_channels=64, hidden_dim=256,
-                 num_class=60, dropout=0.5,
+                 queue_size=32768, momentum=0.999, Temperature=0.07,
+                 mlp=True, in_channels=3, hidden_channels=64,
+                 hidden_dim=256, num_class=60, dropout=0.5,
                  graph_args={'layout': 'ntu-rgb+d', 'strategy': 'spatial'},
                  edge_importance_weighting=True, ose_enabled=True,
-                 ose_feature_dim=256, ose_projector_hidden_dim=2048,
-                 ose_projector_layers=3, ose_queue_size=8192, **kwargs):
+                 # Accepted only so historical checkpoints/config objects can
+                 # be inspected without leaking these obsolete values into the
+                 # backbone constructor.
+                 ose_feature_dim=None, ose_projector_hidden_dim=None,
+                 ose_projector_layers=None, ose_queue_size=None, **kwargs):
         super().__init__(
             base_encoder=base_encoder, pretrain=pretrain,
             feature_dim=feature_dim, queue_size=queue_size,
@@ -33,58 +35,100 @@ class OSEAimCLR(AimCLR):
             edge_importance_weighting=edge_importance_weighting, **kwargs)
 
         self.ose_enabled = bool(ose_enabled)
-        if not self.pretrain or not self.ose_enabled:
+        if not self.pretrain:
             return
 
-        self.ose_queue_size = int(ose_queue_size)
-        if self.ose_queue_size <= 0:
-            raise ValueError('ose_queue_size must be positive')
-
-        self.ose_projector_q = _build_projector(
-            hidden_dim, ose_projector_hidden_dim, ose_feature_dim,
-            ose_projector_layers)
-        self.ose_projector_k = _build_projector(
-            hidden_dim, ose_projector_hidden_dim, ose_feature_dim,
-            ose_projector_layers)
-
+        # These are metadata sidecars for AimCLR's native queue, not another
+        # feature memory.  OSE reads only slots that have received real EMA
+        # keys; native AimCLR keeps its historical random-negative warm start.
         self.register_buffer(
-            'ose_queue', torch.zeros(ose_feature_dim, self.ose_queue_size))
+            'queue_filled', torch.zeros(1, dtype=torch.long))
         self.register_buffer(
-            'ose_queue_ptr', torch.zeros(1, dtype=torch.long))
-        self.register_buffer(
-            'ose_queue_filled', torch.zeros(1, dtype=torch.long))
-        self.register_buffer(
-            'ose_queue_sample_indices',
-            torch.full((self.ose_queue_size,), -1, dtype=torch.long))
-        self.reset_ose_momentum_projector()
+            'queue_sample_indices',
+            torch.full((self.K,), -1, dtype=torch.long))
 
     @torch.no_grad()
-    def reset_ose_momentum_projector(self):
-        """Copy the online OSE projector after global weight initialization."""
-        if not self.pretrain or not self.ose_enabled:
+    def reset_momentum_encoder(self):
+        """Restore exact online/EMA initialization after global init."""
+        if not self.pretrain:
             return
-        for param_q, param_k in zip(self.ose_projector_q.parameters(),
-                                    self.ose_projector_k.parameters()):
+        for param_q, param_k in zip(
+                self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.data.copy_(param_q.data)
             param_k.requires_grad = False
-
-    @torch.no_grad()
-    def _momentum_update_key_encoder(self):
-        super()._momentum_update_key_encoder()
-        if not self.ose_enabled:
-            return
-        for param_q, param_k in zip(self.ose_projector_q.parameters(),
-                                    self.ose_projector_k.parameters()):
-            param_k.data.mul_(self.m).add_(
-                param_q.data, alpha=1.0 - self.m)
 
     @staticmethod
     def _soft_cross_entropy(logits, target):
         return -(target * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
 
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, keys, sample_indices=None):
+        """Write EMA keys and OSE metadata into the one shared queue."""
+        keys = keys.detach()
+        if sample_indices is None:
+            sample_indices = torch.full(
+                (keys.size(0),), -1, dtype=torch.long, device=keys.device)
+        else:
+            sample_indices = sample_indices.detach().to(
+                device=keys.device, dtype=torch.long).view(-1)
+        if sample_indices.size(0) != keys.size(0):
+            raise ValueError('Queue keys and sample indices must align')
+
+        if keys.size(0) >= self.K:
+            keys = keys[-self.K:]
+            sample_indices = sample_indices[-self.K:]
+
+        count = keys.size(0)
+        ptr = int(self.queue_ptr.item())
+        first_count = min(count, self.K - ptr)
+        self.queue[:, ptr:ptr + first_count] = keys[:first_count].t()
+        self.queue_sample_indices[ptr:ptr + first_count] = (
+            sample_indices[:first_count])
+        remaining = count - first_count
+        if remaining > 0:
+            self.queue[:, :remaining] = keys[first_count:].t()
+            self.queue_sample_indices[:remaining] = (
+                sample_indices[first_count:])
+        self.queue_filled[0] = min(
+            self.K, int(self.queue_filled.item()) + count)
+
+    def _online_native_projection(self, view):
+        features = self.encoder_q.forward_features(view)
+        return F.normalize(self.encoder_q.fc(features), dim=1)
+
+    @torch.no_grad()
+    def _teacher_exemplar_projection(self, exemplar):
+        """Encode an EMA exemplar view without changing EMA BN buffers."""
+        batch_norm_state = []
+        for child in self.encoder_k.modules():
+            if isinstance(child, (
+                    torch.nn.BatchNorm1d, torch.nn.BatchNorm2d,
+                    torch.nn.BatchNorm3d)):
+                batch_norm_state.append((
+                    child,
+                    (child.running_mean.clone()
+                     if child.running_mean is not None else None),
+                    (child.running_var.clone()
+                     if child.running_var is not None else None),
+                    (child.num_batches_tracked.clone()
+                     if child.num_batches_tracked is not None else None),
+                ))
+        try:
+            features = self.encoder_k.forward_features(exemplar)
+            projected = self.encoder_k.fc(features)
+        finally:
+            for child, running_mean, running_var, batches in batch_norm_state:
+                if running_mean is not None:
+                    child.running_mean.copy_(running_mean)
+                if running_var is not None:
+                    child.running_var.copy_(running_var)
+                if batches is not None:
+                    child.num_batches_tracked.copy_(batches)
+        return F.normalize(projected, dim=1)
+
     def _class_prototypes(self, exemplar_z, topk, alpha,
                           extra_exemplar_z=None):
-        """Build prototypes from an online anchor, EMA views, and/or neighbors."""
+        """Build P1 prototypes using mutually exclusive shared-queue slots."""
         exemplar_z = F.normalize(exemplar_z, dim=1)
         if extra_exemplar_z is not None:
             if extra_exemplar_z.dim() != 3:
@@ -98,136 +142,201 @@ class OSEAimCLR(AimCLR):
                     'Extra exemplar embeddings do not align with anchors')
             extra_exemplar_z = F.normalize(extra_exemplar_z, dim=2)
 
-        filled = int(self.ose_queue_filled.item())
+        filled = int(self.queue_filled.item())
         neighbor_count = min(max(int(topk), 0), filled)
-        neighbor_indices = None
         memory = None
         if neighbor_count > 0:
             memory = F.normalize(
-                self.ose_queue[:, :filled].detach().t(), dim=1)
+                self.queue[:, :filled].detach().clone().t(), dim=1)
             similarity = torch.matmul(exemplar_z, memory.t())
             if exemplar_z.size(0) > 1:
-                other_similarity = similarity.unsqueeze(0).expand(
-                    exemplar_z.size(0), -1, -1).clone()
-                diagonal = torch.eye(
-                    exemplar_z.size(0), dtype=torch.bool,
-                    device=exemplar_z.device)
-                other_similarity[diagonal] = -float('inf')
-                max_other = other_similarity.max(dim=1)[0]
+                # The direct CxCxK expansion is nearly 0.5 GB for NTU60
+                # and AimCLR's K=32768 queue.  Per-slot top-2 gives the same
+                # max-over-other-classes value with only CxK storage.
+                top_values, top_classes = torch.topk(
+                    similarity, k=2, dim=0)
+                class_indices = torch.arange(
+                    exemplar_z.size(0), device=exemplar_z.device
+                ).unsqueeze(1)
+                max_other = torch.where(
+                    top_classes[0].unsqueeze(0) == class_indices,
+                    top_values[1].unsqueeze(0),
+                    top_values[0].unsqueeze(0))
             else:
                 max_other = torch.zeros_like(similarity)
             score = (
                 float(alpha) * similarity -
                 (1.0 - float(alpha)) * max_other)
-            neighbor_indices = torch.topk(
-                score, k=neighbor_count, dim=1).indices
-            neighbor_sample_indices = self.ose_queue_sample_indices[
-                :filled][neighbor_indices].detach()
+
+            # P1: every queue slot receives one owner before per-class Top-K.
+            owner = score.argmax(dim=0)
+            neighbor_queue_indices = torch.full(
+                (exemplar_z.size(0), neighbor_count), -1,
+                dtype=torch.long, device=exemplar_z.device)
+            neighbor_valid = torch.zeros_like(
+                neighbor_queue_indices, dtype=torch.bool)
+            for class_index in range(exemplar_z.size(0)):
+                candidates = torch.nonzero(
+                    owner == class_index, as_tuple=False).flatten()
+                selected_count = min(
+                    neighbor_count, int(candidates.numel()))
+                if selected_count == 0:
+                    continue
+                selected_in_candidates = torch.topk(
+                    score[class_index, candidates],
+                    k=selected_count).indices
+                selected = candidates[selected_in_candidates]
+                neighbor_queue_indices[
+                    class_index, :selected_count] = selected
+                neighbor_valid[class_index, :selected_count] = True
+
+            neighbor_sample_indices = torch.full_like(
+                neighbor_queue_indices, -1)
+            neighbor_sample_indices[neighbor_valid] = (
+                self.queue_sample_indices[:filled][
+                    neighbor_queue_indices[neighbor_valid]])
         else:
-            neighbor_sample_indices = torch.empty(
+            neighbor_queue_indices = torch.empty(
                 exemplar_z.size(0), 0, dtype=torch.long,
                 device=exemplar_z.device)
+            neighbor_sample_indices = torch.empty_like(
+                neighbor_queue_indices)
+            neighbor_valid = torch.empty(
+                exemplar_z.size(0), 0, dtype=torch.bool,
+                device=exemplar_z.device)
 
-        extra_count = (extra_exemplar_z.size(1)
-                       if extra_exemplar_z is not None else 0)
-        component_count = 1 + extra_count + neighbor_count
         prototypes = []
+        component_counts = []
         for class_index in range(exemplar_z.size(0)):
             component_groups = [
                 exemplar_z[class_index:class_index + 1]]
             if extra_exemplar_z is not None:
                 component_groups.append(extra_exemplar_z[class_index])
-            if neighbor_count > 0:
-                component_groups.append(
-                    memory[neighbor_indices[class_index]])
+            selected = neighbor_queue_indices[class_index][
+                neighbor_valid[class_index]]
+            if selected.numel() > 0:
+                component_groups.append(memory[selected])
             components = torch.cat(component_groups, dim=0)
-            weights = torch.softmax(
-                torch.matmul(components, exemplar_z[class_index]), dim=0)
-            prototypes.append(
-                torch.sum(weights.unsqueeze(1) * components, dim=0))
-        return (torch.stack(prototypes, dim=0),
-                neighbor_sample_indices, component_count)
+            # Preserve the successful P1 aggregation: raw anchor similarity.
+            aggregation_scores = torch.matmul(
+                components, exemplar_z[class_index])
+            weights = torch.softmax(aggregation_scores, dim=0)
+            prototypes.append(torch.sum(
+                weights.unsqueeze(1) * components, dim=0))
+            component_counts.append(components.size(0))
 
-    @torch.no_grad()
-    def _dequeue_and_enqueue_ose(self, keys, sample_indices=None):
-        keys = keys.detach()
-        if sample_indices is None:
-            sample_indices = torch.full(
-                (keys.size(0),), -1, dtype=torch.long, device=keys.device)
+        valid_slots = neighbor_queue_indices[neighbor_valid]
+        if valid_slots.numel() > 0:
+            overlap_rate = exemplar_z.new_tensor(
+                1.0 - float(torch.unique(valid_slots).numel()) /
+                float(valid_slots.numel()))
         else:
-            sample_indices = sample_indices.detach().to(
-                device=keys.device, dtype=torch.long).view(-1)
-        if sample_indices.size(0) != keys.size(0):
-            raise ValueError('OSE queue keys and sample indices must align')
-        if keys.size(0) >= self.ose_queue_size:
-            keys = keys[-self.ose_queue_size:]
-            sample_indices = sample_indices[-self.ose_queue_size:]
+            overlap_rate = exemplar_z.new_tensor(0.0)
 
-        count = keys.size(0)
-        ptr = int(self.ose_queue_ptr.item())
-        first_count = min(count, self.ose_queue_size - ptr)
-        self.ose_queue[:, ptr:ptr + first_count] = keys[:first_count].t()
-        self.ose_queue_sample_indices[ptr:ptr + first_count] = (
-            sample_indices[:first_count])
-        remaining = count - first_count
-        if remaining > 0:
-            self.ose_queue[:, :remaining] = keys[first_count:].t()
-            self.ose_queue_sample_indices[:remaining] = (
-                sample_indices[first_count:])
-
-        self.ose_queue_ptr[0] = (
-            ptr + count) % self.ose_queue_size
-        self.ose_queue_filled[0] = min(
-            self.ose_queue_size,
-            int(self.ose_queue_filled.item()) + count)
-
-    def _online_ose_projection(self, view):
-        features = self.encoder_q.forward_features(view)
-        return F.normalize(self.ose_projector_q(features), dim=1)
+        return {
+            'prototypes': torch.stack(prototypes, dim=0),
+            'neighbor_queue_indices': neighbor_queue_indices.detach(),
+            'neighbor_sample_indices': neighbor_sample_indices.detach(),
+            'neighbor_valid': neighbor_valid.detach(),
+            'component_counts': torch.tensor(
+                component_counts, dtype=torch.long,
+                device=exemplar_z.device),
+            'overlap_rate': overlap_rate,
+        }
 
     @torch.no_grad()
-    def _teacher_exemplar_projection(self, exemplar):
-        """Project an EMA exemplar view without repeated BN-buffer updates."""
-        modules = (self.encoder_k, self.ose_projector_k)
-        batch_norm_state = []
-        for module in modules:
-            for child in module.modules():
-                if isinstance(child, (
-                        nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                    batch_norm_state.append((
-                        child,
-                        (child.running_mean.clone()
-                         if child.running_mean is not None else None),
-                        (child.running_var.clone()
-                         if child.running_var is not None else None),
-                        (child.num_batches_tracked.clone()
-                         if child.num_batches_tracked is not None else None),
-                    ))
-        try:
-            features = self.encoder_k.forward_features(exemplar)
-            projected = self.ose_projector_k(features)
-        finally:
-            for child, running_mean, running_var, batches in batch_norm_state:
-                if running_mean is not None:
-                    child.running_mean.copy_(running_mean)
-                if running_var is not None:
-                    child.running_var.copy_(running_var)
-                if batches is not None:
-                    child.num_batches_tracked.copy_(batches)
-        return F.normalize(projected, dim=1)
+    def _ose_constrained_nnm_mask(
+            self, teacher_target, prototype_state,
+            l_neg, l_neg_e, l_neg_ed, sample_indices=None):
+        """Choose at most one queue positive from the predicted P1 pool.
 
-    def _ose_losses(self, q_ose, k_ose, exemplar_z, extra_exemplar_z,
+        OSE determines the semantic candidate pool with the EMA weak view.
+        AimCLR then ranks that small pool by the maximum similarity across its
+        normal, extreme, and dropped-extreme query streams.  The current
+        sample's historical queue entries are excluded when indices exist.
+        """
+        batch_size = teacher_target.size(0)
+        positive_mask = torch.zeros_like(l_neg)
+        predicted_classes = teacher_target.argmax(dim=1)
+        selected_queue_indices = torch.full(
+            (batch_size,), -1, dtype=torch.long,
+            device=teacher_target.device)
+        candidate_counts = torch.zeros(
+            batch_size, dtype=torch.long, device=teacher_target.device)
+        same_sample_filtered = torch.zeros(
+            (), dtype=torch.long, device=teacher_target.device)
+
+        if sample_indices is not None:
+            sample_indices = sample_indices.detach().to(
+                device=teacher_target.device, dtype=torch.long).view(-1)
+            if sample_indices.numel() != batch_size:
+                raise ValueError(
+                    'Sample indices must match the contrastive batch size')
+
+        neighbor_indices = prototype_state['neighbor_queue_indices']
+        neighbor_valid = prototype_state['neighbor_valid']
+        multi_view_similarity = torch.maximum(
+            l_neg, torch.maximum(l_neg_e, l_neg_ed))
+
+        for class_index in range(teacher_target.size(1)):
+            candidates = neighbor_indices[class_index][
+                neighbor_valid[class_index]]
+            rows = torch.nonzero(
+                predicted_classes == class_index,
+                as_tuple=False).flatten()
+            if candidates.numel() == 0 or rows.numel() == 0:
+                continue
+            candidate_scores = multi_view_similarity[
+                rows.unsqueeze(1), candidates.unsqueeze(0)]
+            candidate_valid = torch.ones_like(
+                candidate_scores, dtype=torch.bool)
+            if sample_indices is not None:
+                current_indices = sample_indices[rows].unsqueeze(1)
+                same_sample = (
+                    current_indices >= 0) & (
+                    self.queue_sample_indices[candidates].unsqueeze(0) ==
+                    current_indices)
+                candidate_valid &= ~same_sample
+                same_sample_filtered += same_sample.sum()
+
+            row_candidate_counts = candidate_valid.sum(dim=1)
+            candidate_counts[rows] = row_candidate_counts
+            rows_with_candidate = row_candidate_counts > 0
+            valid_scores = candidate_scores.masked_fill(
+                ~candidate_valid, float('-inf'))
+            best_in_pool = valid_scores.argmax(dim=1)
+            selected = candidates[best_in_pool[rows_with_candidate]]
+            selected_rows = rows[rows_with_candidate]
+            positive_mask[selected_rows, selected] = 1.0
+            selected_queue_indices[selected_rows] = selected
+
+        selected_sample_indices = torch.full_like(
+            selected_queue_indices, -1)
+        selected_valid = selected_queue_indices >= 0
+        selected_sample_indices[selected_valid] = (
+            self.queue_sample_indices[
+                selected_queue_indices[selected_valid]])
+        return positive_mask.detach(), {
+            'nnm_predicted_classes': predicted_classes.detach(),
+            'nnm_selected_queue_indices': selected_queue_indices.detach(),
+            'nnm_selected_sample_indices': selected_sample_indices.detach(),
+            'nnm_candidate_count': candidate_counts.float().mean(),
+            'nnm_positive_rate': selected_valid.float().mean(),
+            'nnm_same_sample_filtered': same_sample_filtered.float(),
+        }
+
+    def _ose_losses(self, q, k, exemplar_z, extra_exemplar_z,
                     mixed_view, mix_index, mix_beta, compute_mix_proto,
-                    compute_mix_ins, topk, alpha, tau_s, tau_t,
-                    sample_indices):
-        (prototypes, neighbor_sample_indices,
-         prototype_component_count) = self._class_prototypes(
+                    compute_mix_ins, topk, alpha, tau_s, tau_t):
+        prototype_state = self._class_prototypes(
             exemplar_z, topk=topk, alpha=alpha,
             extra_exemplar_z=extra_exemplar_z)
+        prototypes = prototype_state['prototypes']
+
         student_logits = torch.matmul(
-            q_ose, prototypes.t()) / max(float(tau_s), 1e-12)
+            q, prototypes.t()) / max(float(tau_s), 1e-12)
         teacher_logits = torch.matmul(
-            k_ose.detach(), prototypes.detach().t()) / max(
+            k.detach(), prototypes.detach().t()) / max(
                 float(tau_t), 1e-12)
         teacher_target = torch.softmax(teacher_logits, dim=1).detach()
         align_loss = self._soft_cross_entropy(
@@ -235,7 +344,8 @@ class OSEAimCLR(AimCLR):
 
         prototype_similarity = torch.matmul(prototypes, prototypes.t())
         off_diagonal = ~torch.eye(
-            prototypes.size(0), dtype=torch.bool, device=prototypes.device)
+            prototypes.size(0), dtype=torch.bool,
+            device=prototypes.device)
         if prototypes.size(0) > 1:
             disp_loss = prototype_similarity[off_diagonal].mean()
             disp_loss = disp_loss / max(float(tau_s), 1e-12)
@@ -245,26 +355,23 @@ class OSEAimCLR(AimCLR):
 
         mix_proto_loss = proto_loss.new_tensor(0.0)
         mix_ins_loss = proto_loss.new_tensor(0.0)
-        compute_mix = bool(compute_mix_proto) or bool(compute_mix_ins)
-        if compute_mix:
-            if mixed_view.size(0) != q_ose.size(0):
+        if compute_mix_proto or compute_mix_ins:
+            if mixed_view.size(0) != q.size(0):
                 raise ValueError(
-                    'Mixed view batch size must match the unlabeled views')
+                    'Mixed view batch size must match weak views')
             mix_index = mix_index.detach().to(
-                device=q_ose.device, dtype=torch.long).view(-1)
-            if mix_index.numel() != q_ose.size(0):
+                device=q.device, dtype=torch.long).view(-1)
+            if mix_index.numel() != q.size(0):
                 raise ValueError(
-                    'Mix permutation size must match the batch size')
+                    'Mix permutation size must match batch size')
             if (mix_index.min().item() < 0 or
-                    mix_index.max().item() >= q_ose.size(0)):
+                    mix_index.max().item() >= q.size(0)):
                 raise ValueError('Mix permutation contains invalid indices')
             mix_beta = float(mix_beta)
             if not 0.0 <= mix_beta <= 1.0:
                 raise ValueError('Mix coefficient must be in [0, 1]')
 
-            # This branch uses only encoder_q -> ose_projector_q.  It never
-            # enters the AimCLR head, either queue, or any teacher path.
-            mixed_z = self._online_ose_projection(mixed_view)
+            mixed_z = self._online_native_projection(mixed_view)
             if compute_mix_proto:
                 mixed_logits = torch.matmul(
                     mixed_z, prototypes.t()) / max(
@@ -276,15 +383,13 @@ class OSEAimCLR(AimCLR):
                     (1.0 - mix_beta) * teacher_target[mix_index])
                 mix_proto_loss = self._soft_cross_entropy(
                     mixed_logits, mixed_target)
-
             if compute_mix_ins:
                 instance_logits = torch.matmul(
-                    mixed_z, k_ose.detach().t()) / max(
+                    mixed_z, k.detach().t()) / max(
                         float(tau_s), 1e-12)
                 instance_log_prob = F.log_softmax(
                     instance_logits, dim=1)
-                row = torch.arange(
-                    mixed_z.size(0), device=mixed_z.device)
+                row = torch.arange(mixed_z.size(0), device=mixed_z.device)
                 mix_ins_loss = -(
                     mix_beta * instance_log_prob[row, row] +
                     (1.0 - mix_beta) *
@@ -294,10 +399,7 @@ class OSEAimCLR(AimCLR):
         target_entropy = -(
             teacher_target * teacher_target.clamp_min(1e-12).log()
         ).sum(dim=1).mean()
-        if int(topk) > 0:
-            self._dequeue_and_enqueue_ose(k_ose, sample_indices)
-
-        return {
+        result = {
             'proto': proto_loss,
             'align': align_loss,
             'disp': disp_loss,
@@ -306,17 +408,22 @@ class OSEAimCLR(AimCLR):
             'mix_ins': mix_ins_loss,
             'target_entropy': target_entropy,
             'align_kl': align_loss - target_entropy,
-            'queue_fill': self.ose_queue_filled.float(),
-            'neighbor_sample_indices': neighbor_sample_indices,
-            'prototype_components': proto_loss.new_tensor(
-                prototype_component_count, dtype=torch.long),
+            'queue_fill': self.queue_filled.float(),
+            'neighbor_queue_indices': (
+                prototype_state['neighbor_queue_indices']),
+            'neighbor_sample_indices': (
+                prototype_state['neighbor_sample_indices']),
+            'prototype_component_counts': (
+                prototype_state['component_counts']),
+            'neighbor_overlap_rate': prototype_state['overlap_rate'],
         }
+        return result, teacher_target, prototype_state
 
     def forward(self, im_q_extreme, im_q, im_k=None, nnm=False, topk=1,
                 exemplar=None, mixed_view=None, mix_index=None, mix_beta=None,
                 compute_ose=False, compute_mix_proto=False,
                 compute_mix_ins=False, extra_exemplar_views=None,
-                sample_indices=None, ose_topk=8, ose_alpha=0.75,
+                sample_indices=None, ose_topk=4, ose_alpha=0.75,
                 ose_tau_s=0.1, ose_tau_t=0.04):
         if not self.pretrain:
             return self.encoder_q(im_q)
@@ -330,7 +437,7 @@ class OSEAimCLR(AimCLR):
         if compute_ose and not self.ose_enabled:
             raise ValueError('OSE losses cannot run when OSE is disabled')
         if compute_mix and not compute_ose:
-            raise ValueError('Lmix requires OSE losses to be active')
+            raise ValueError('Lmix requires active OSE')
         if compute_mix:
             if mixed_view is None or mix_index is None or mix_beta is None:
                 raise ValueError(
@@ -338,8 +445,7 @@ class OSEAimCLR(AimCLR):
         elif any(value is not None for value in (
                 mixed_view, mix_index, mix_beta)):
             raise ValueError(
-                'Mixed inputs were provided while both Lmix terms are disabled')
-
+                'Mixed inputs require at least one enabled Lmix term')
         q_features = self.encoder_q.forward_features(im_q)
         q = F.normalize(self.encoder_q.fc(q_features), dim=1)
         q_extreme_features, q_extreme_drop_features = (
@@ -351,10 +457,8 @@ class OSEAimCLR(AimCLR):
 
         if compute_ose:
             if exemplar is None:
-                raise ValueError('AimCLR+Lproto requires exemplar inputs')
-            q_ose = F.normalize(
-                self.ose_projector_q(q_features), dim=1)
-            exemplar_z = self._online_ose_projection(exemplar)
+                raise ValueError('AimCLR A2 requires exemplar inputs')
+            exemplar_z = self._online_native_projection(exemplar)
             if extra_exemplar_views is None:
                 extra_exemplar_views = []
             if not isinstance(extra_exemplar_views, (tuple, list)):
@@ -369,29 +473,21 @@ class OSEAimCLR(AimCLR):
             self._momentum_update_key_encoder()
             k_features = self.encoder_k.forward_features(im_k)
             k = F.normalize(self.encoder_k.fc(k_features), dim=1)
-            if compute_ose:
-                k_ose = F.normalize(
-                    self.ose_projector_k(k_features), dim=1)
-                if extra_exemplar_views:
-                    extra_exemplar_z = torch.stack([
-                        self._teacher_exemplar_projection(extra_view)
-                        for extra_view in extra_exemplar_views
-                    ], dim=1)
-                else:
-                    extra_exemplar_z = None
+            if compute_ose and extra_exemplar_views:
+                extra_exemplar_z = torch.stack([
+                    self._teacher_exemplar_projection(extra_view)
+                    for extra_view in extra_exemplar_views
+                ], dim=1)
+            else:
+                extra_exemplar_z = None
 
-        l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
-        l_neg = torch.einsum(
-            'nc,ck->nk', [q, self.queue.clone().detach()])
-        l_pos_e = torch.einsum(
-            'nc,nc->n', [q_extreme, k]).unsqueeze(-1)
-        l_neg_e = torch.einsum(
-            'nc,ck->nk', [q_extreme, self.queue.clone().detach()])
-        l_pos_ed = torch.einsum(
-            'nc,nc->n', [q_extreme_drop, k]).unsqueeze(-1)
-        l_neg_ed = torch.einsum(
-            'nc,ck->nk', [
-                q_extreme_drop, self.queue.clone().detach()])
+        queue_snapshot = self.queue.clone().detach()
+        l_pos = torch.sum(q * k, dim=1, keepdim=True)
+        l_neg = torch.matmul(q, queue_snapshot)
+        l_pos_e = torch.sum(q_extreme * k, dim=1, keepdim=True)
+        l_neg_e = torch.matmul(q_extreme, queue_snapshot)
+        l_pos_ed = torch.sum(q_extreme_drop * k, dim=1, keepdim=True)
+        l_neg_ed = torch.matmul(q_extreme_drop, queue_snapshot)
 
         logits = torch.cat([l_pos, l_neg], dim=1) / self.T
         logits_e = torch.cat([l_pos_e, l_neg_e], dim=1) / self.T
@@ -400,34 +496,61 @@ class OSEAimCLR(AimCLR):
         logits_ed_prob = torch.softmax(logits_ed, dim=1)
         labels_ddm = torch.softmax(logits.detach(), dim=1)
 
-        if nnm:
+        queue_positive_mask = torch.zeros_like(l_neg)
+        if nnm and not compute_ose:
             _, topkdix = torch.topk(l_neg, topk, dim=1)
             _, topkdix_e = torch.topk(l_neg_e, topk, dim=1)
             _, topkdix_ed = torch.topk(l_neg_ed, topk, dim=1)
-            topk_onehot = torch.zeros_like(l_neg)
-            topk_onehot.scatter_(1, topkdix, 1)
-            topk_onehot.scatter_(1, topkdix_e, 1)
-            topk_onehot.scatter_(1, topkdix_ed, 1)
-            first_pos = torch.ones(
-                topk_onehot.size(0), 1, device=topk_onehot.device)
-            contrast_target = torch.cat(
-                [first_pos, topk_onehot], dim=1)
-        else:
-            contrast_target = torch.zeros(
-                logits.shape[0], dtype=torch.long, device=logits.device)
+            queue_positive_mask.scatter_(1, topkdix, 1.0)
+            queue_positive_mask.scatter_(1, topkdix_e, 1.0)
+            queue_positive_mask.scatter_(1, topkdix_ed, 1.0)
 
         ose_losses = None
         if compute_ose:
-            ose_losses = self._ose_losses(
-                q_ose=q_ose, k_ose=k_ose, exemplar_z=exemplar_z,
+            ose_losses, teacher_target, prototype_state = self._ose_losses(
+                q=q, k=k, exemplar_z=exemplar_z,
                 extra_exemplar_z=extra_exemplar_z,
                 mixed_view=mixed_view, mix_index=mix_index,
                 mix_beta=mix_beta,
                 compute_mix_proto=compute_mix_proto,
                 compute_mix_ins=compute_mix_ins, topk=ose_topk,
-                alpha=ose_alpha, tau_s=ose_tau_s, tau_t=ose_tau_t,
-                sample_indices=sample_indices)
+                alpha=ose_alpha, tau_s=ose_tau_s, tau_t=ose_tau_t)
+            if nnm:
+                queue_positive_mask, nnm_state = (
+                    self._ose_constrained_nnm_mask(
+                        teacher_target=teacher_target,
+                        prototype_state=prototype_state,
+                        l_neg=l_neg, l_neg_e=l_neg_e,
+                        l_neg_ed=l_neg_ed,
+                        sample_indices=sample_indices))
+                ose_losses.update(nnm_state)
+            else:
+                ose_losses.update({
+                    'nnm_predicted_classes': teacher_target.argmax(
+                        dim=1).detach(),
+                    'nnm_selected_queue_indices': torch.full(
+                        (q.size(0),), -1, dtype=torch.long,
+                        device=q.device),
+                    'nnm_selected_sample_indices': torch.full(
+                        (q.size(0),), -1, dtype=torch.long,
+                        device=q.device),
+                    'nnm_candidate_count': q.new_tensor(0.0),
+                    'nnm_positive_rate': q.new_tensor(0.0),
+                    'nnm_same_sample_filtered': q.new_tensor(0.0),
+                })
 
-        self._dequeue_and_enqueue(k)
+        if nnm:
+            contrast_target = torch.cat([
+                torch.ones(
+                    q.size(0), 1, device=q.device, dtype=q.dtype),
+                queue_positive_mask,
+            ], dim=1)
+        else:
+            contrast_target = torch.zeros(
+                q.size(0), dtype=torch.long, device=q.device)
+
+        # Every target and loss above reads the old queue.  The current EMA
+        # weak key is inserted exactly once only after those values exist.
+        self._dequeue_and_enqueue(k, sample_indices)
         return (logits, contrast_target, logits_e_prob, logits_ed_prob,
                 labels_ddm, ose_losses)
