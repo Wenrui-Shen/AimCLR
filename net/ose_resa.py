@@ -7,7 +7,19 @@ import torch.nn.functional as F
 from torchlight import import_class
 
 
-def _build_projector(input_dim, hidden_dim, output_dim, num_layers):
+def _build_projector(input_dim, hidden_dim, output_dim, num_layers,
+                     projector_type='resa'):
+    if projector_type == 'aimclr':
+        # Keep the exact module layout of AimCLR's encoder_q.fc so Stage2 can
+        # reuse both linear layers without changing the learned 128-d space.
+        return nn.Sequential(
+            nn.Linear(input_dim, input_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(input_dim, output_dim),
+        )
+    if projector_type != 'resa':
+        raise ValueError(
+            'projector_type must be either "resa" or "aimclr"')
     if num_layers < 2:
         raise ValueError('ReSA projector requires at least two layers')
 
@@ -50,7 +62,8 @@ class OSEResA(nn.Module):
 
     def __init__(self, base_encoder=None, pretrain=True, feature_dim=256,
                  projector_hidden_dim=2048, projector_layers=3,
-                 use_predictor=True, ose_enabled=True, queue_size=8192,
+                 projector_type='resa', use_predictor=True,
+                 ose_enabled=True, queue_size=8192,
                  queue_contrast_enabled=False, instance_feature_dim=128,
                  instance_queue_size=32768, instance_temperature=0.07,
                  cluster_temperature=0.4, sinkhorn_temperature=0.05,
@@ -67,6 +80,7 @@ class OSEResA(nn.Module):
         if self.ose_prototype_stage not in (0, 1, 2, 3):
             raise ValueError('ose_prototype_stage must be one of 0, 1, 2, 3')
         self.queue_contrast_enabled = bool(queue_contrast_enabled)
+        self.projector_type = str(projector_type)
         if self.queue_contrast_enabled and not self.ose_enabled:
             raise ValueError(
                 'Category-corrected queue contrast requires OSE')
@@ -86,9 +100,11 @@ class OSEResA(nn.Module):
             graph_args=graph_args,
             edge_importance_weighting=edge_importance_weighting, **kwargs)
         self.projector_q = _build_projector(
-            hidden_dim, projector_hidden_dim, feature_dim, projector_layers)
+            hidden_dim, projector_hidden_dim, feature_dim, projector_layers,
+            projector_type=self.projector_type)
         self.projector_k = _build_projector(
-            hidden_dim, projector_hidden_dim, feature_dim, projector_layers)
+            hidden_dim, projector_hidden_dim, feature_dim, projector_layers,
+            projector_type=self.projector_type)
         self.predictor = (_build_predictor(feature_dim, projector_hidden_dim)
                           if use_predictor else nn.Identity())
 
@@ -500,6 +516,12 @@ class OSEResA(nn.Module):
     def _online_projection(self, view):
         features = self.encoder_q.forward_features(view)
         return F.normalize(self.projector_q(features), dim=1)
+
+    @torch.no_grad()
+    def teacher_projection(self, view):
+        """Project a batch with the EMA branch (used for Stage2 prefill)."""
+        features = self.encoder_k.forward_features(view)
+        return F.normalize(self.projector_k(features), dim=1)
 
     @torch.no_grad()
     def _teacher_exemplar_projection(self, exemplar):

@@ -1,10 +1,51 @@
 # AimCLR / ReSA / OSE 研究交接
 
-最后更新：2026-07-29。本文写给一个完全没有上下文的新会话；不要依赖旧聊天记录。
+最后更新：2026-08-02。本文写给一个完全没有上下文的新会话；不要依赖旧聊天记录。
 
-## 0. 2026-07-29 A2 主线覆盖说明
+## 0. 2026-08-02 A3 二阶段主线覆盖说明
 
-本节是最新指令，覆盖本文后续仍保留的 P0–P3 旧计划。旧章节只作为研究历史，不再代表当前配置目录和下一步任务。
+A2 线性评估只有 `73.79`，说明在同一阶段把 OSE 类别收缩与 AimCLR
+memory-bank instance discrimination 强行合并仍然存在明显目标冲突。当前新增 A3：
+
+```text
+Stage1: 完全默认 AimCLR (`pretext_aimclr_xsub_joint.yaml`), 300 epochs
+Stage2: ReSA + OSE P1 Q4 M-F, 300 epochs
+```
+
+Stage2 的具体过渡语义：
+
+- 从 AimCLR checkpoint 的 `encoder_q` 加载 backbone；
+- 把 AimCLR `encoder_q.fc` 的 `256 -> 256 -> 128` MLP 原样迁移为
+  Stage2 的 ReSA/OSE 共用 projector；
+- online 参数加载完成后复制到 EMA 分支，Stage2 起点两支严格一致；
+- 不迁移 AimCLR queue、NNM、DDM 或任何 memory-bank 对比损失；
+- ReSA predictor 在 A3 首版关闭，避免引入随机 head；
+- 在第一次优化前，用迁移后的 EMA encoder-projector 和固定 seed 的 weak
+  views 离线填满 OSE queue，并排除 one-shot exemplars；
+- Stage2 只优化 `LReSA + Lproto + Lmix-proto + Lmix-ins`；
+- prototype 固定使用最佳 P1 互斥 Q4，其他 P0/P2/P3 配置不恢复。
+
+新增入口和配置：
+
+```text
+processor/pretrain_ose_resa_stage2.py
+config/ntu60/pretext/pretext_ose_resa_a3_stage2_p1_q4_mf_xsub_joint.yaml
+config/ntu60/linear_eval/linear_eval_ose_resa_a3_stage2_p1_q4_mf_xsub_joint.yaml
+```
+
+正式运行：
+
+```bash
+python main.py pretrain_ose_resa_stage2 \
+  --config config/ntu60/pretext/pretext_ose_resa_a3_stage2_p1_q4_mf_xsub_joint.yaml
+
+python main.py linear_evaluation \
+  --config config/ntu60/linear_eval/linear_eval_ose_resa_a3_stage2_p1_q4_mf_xsub_joint.yaml
+```
+
+## 0.1 2026-07-29 A2 历史主线说明
+
+本节记录 A2 当时的覆盖指令；现已被上面的 A3 二阶段方案取代。
 
 新增正式结果：
 
@@ -15,7 +56,7 @@ P2 = 78.15
 P3 = 78.80
 ```
 
-P1 仍是可靠 prototype 阶段的最佳版本；继续修改 prototype 聚合没有超过 P1。当前主线已改为在 AimCLR 原生正负关系中解决 OSE 与实例对比学习的冲突：
+P1 仍是可靠 prototype 阶段的最佳版本；继续修改 prototype 聚合没有超过 P1。A2 当时尝试在 AimCLR 原生正负关系中解决 OSE 与实例对比学习的冲突：
 
 ```text
 A2 = AimCLR
@@ -41,7 +82,7 @@ A2 = AimCLR
 - queue 的 `sample_indices` 是同一个 feature queue 的元数据 sidecar，用于同样本过滤和诊断，不是第二个 queue；
 - `mining_epoch=150` 是唯一阶段开关：epoch 150 及以前为 AimCLR，epoch 150 以后同时启用 P1 prototype、受约束 NNM、Lproto 和两项 Lmix。
 
-当前配置目录只保留两份 OSE 配置：
+A2 阶段配置目录只保留了两份 OSE 配置：
 
 ```text
 config/ntu60/pretext/pretext_ose_aimclr_a2_p1_q4_mf_xsub_joint.yaml

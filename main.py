@@ -36,6 +36,8 @@ if __name__ == '__main__':
     processors['pretrain_aimclr'] = import_class('processor.pretrain_aimclr.AimCLR_Processor')
     processors['pretrain_ose_aimclr'] = import_class('processor.pretrain_ose_aimclr.OSEAimCLR_Processor')
     processors['pretrain_ose_resa'] = import_class('processor.pretrain_ose_resa.OSEResAProcessor')
+    processors['pretrain_ose_resa_stage2'] = import_class(
+        'processor.pretrain_ose_resa_stage2.OSEResAStage2Processor')
     processors['pretrain_resa'] = import_class('processor.pretrain_ose_resa.OSEResAProcessor')
     processors['pretrain_prc'] = import_class('processor.pretrain_prc.PRC_Processor')
     processors['linear_evaluation'] = import_class('processor.linear_evaluation.LE_Processor')
