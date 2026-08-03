@@ -2,16 +2,17 @@
 
 最后更新：2026-08-03。本文写给一个完全没有上下文的新会话；不要依赖旧聊天记录。
 
-## 0. 2026-08-03 A3 native 二阶段主线覆盖说明
+## 0. 2026-08-03 A4 多流标签原型主线覆盖说明
 
 A2 线性评估只有 `73.79`，说明在同一阶段把 OSE 类别收缩与 AimCLR
 memory-bank instance discrimination 强行合并仍然存在明显目标冲突。A3 首版
-平滑迁移模型在 epoch50/100 得到 `76.26`，epoch300 得到 `75.96`，相比
-Stage1 `75.27` 提升有限。当前 A3 已改为 native ReSA+OSE P1：
+平滑迁移模型在 epoch50/100 得到 `76.26`，epoch300 得到 `75.96`；A3
+native ReSA+OSE P1 进一步达到 `78.29`，相比 Stage1 `75.27` 提升 `3.02`。
+当前 A4 在 native Stage2 上加入多流标签原型：
 
 ```text
 Stage1: 完全默认 AimCLR (`pretext_aimclr_xsub_joint.yaml`), 300 epochs
-Stage2: native ReSA + OSE P1 Q4 M-F, 100 epochs
+Stage2: native ReSA + OSE J/M/B P1 Q4 M-F, 100 epochs
 ```
 
 Stage2 的具体过渡语义：
@@ -25,6 +26,13 @@ Stage2 的具体过渡语义：
 - 不离线预填随机 projector 产生的无意义 OSE feature；queue 在训练中自然填充；
 - 主实验的 backbone、projector 和 predictor 共用 cosine `0.25 -> 0`；
   `stage2_head_lr` 仍保留为配置开关，仅用于分组学习率消融；
+- 每类同一个增强后的带标签 exemplar 确定性构造 joint、motion、bone；
+  joint 走 online，motion/bone 走 EMA；
+- 以 joint 为参考，对三个归一化 embedding 的 cosine agreement 做无超参
+  softmax 聚合，得到 label-only prototype；
+- label-only prototype 是 Q0 的最终原型，也是 P1 Q4 互斥邻居竞争的类别锚点；
+- 主配置为 `[joint, motion, bone] + Q4`；通过
+  `ose_exemplar_modalities` 和 `ose_topk: 0/4` 完成 2x2 消融；
 - Stage2 只优化 `LReSA + Lproto + Lmix-proto + Lmix-ins`；
 - prototype 固定使用最佳 P1 互斥 Q4，其他 P0/P2/P3 配置不恢复。
 

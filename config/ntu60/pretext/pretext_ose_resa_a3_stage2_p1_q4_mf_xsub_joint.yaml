@@ -1,4 +1,4 @@
-work_dir: ./data/ntu60_cs/aimclr_to_native_ose_resa_a3_p1_q4_mf_100ep_joint/pretext
+work_dir: ./data/ntu60_cs/aimclr_to_native_ose_resa_a4_jmb_p1_q4_mf_100ep_joint/pretext
 
 # Only the default AimCLR online backbone initializes Stage2. ReSA/OSE uses
 # its native projector and predictor; the AimCLR head and queue are discarded.
@@ -66,6 +66,7 @@ ose_exclude_exemplars: True
 ose_topk: 4
 ose_prototype_stage: 1
 ose_exemplar_views: 1
+ose_exemplar_modalities: [joint, motion, bone]
 ose_alpha: 0.75
 ose_tau_s: 0.1
 ose_tau_t: 0.04

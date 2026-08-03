@@ -226,20 +226,42 @@ class OSEResA(nn.Module):
             float(alpha) * class_similarity -
             (1.0 - float(alpha)) * max_other)
 
+    @staticmethod
+    def _fuse_labeled_exemplars(exemplar_z, extra_exemplar_z=None):
+        """Fuse one online anchor and optional EMA structural modalities.
+
+        The online exemplar is the reference. Motion/bone (or additional
+        labeled views) are weighted only by their cosine agreement with that
+        reference, so this introduces no extra fusion hyperparameter.
+        """
+        exemplar_z = F.normalize(exemplar_z, dim=1)
+        if extra_exemplar_z is None:
+            return exemplar_z
+        if extra_exemplar_z.dim() != 3:
+            raise ValueError(
+                'Extra exemplar embeddings must have shape [C, R, D]')
+        expected = (
+            exemplar_z.size(0), extra_exemplar_z.size(1),
+            exemplar_z.size(1))
+        if tuple(extra_exemplar_z.shape) != expected:
+            raise ValueError(
+                'Extra exemplar embeddings do not align with anchors')
+        extra_exemplar_z = F.normalize(extra_exemplar_z, dim=2)
+        components = torch.cat([
+            exemplar_z.unsqueeze(1), extra_exemplar_z,
+        ], dim=1)
+        scores = torch.sum(
+            components * exemplar_z.unsqueeze(1), dim=2)
+        weights = torch.softmax(scores, dim=1)
+        fused = torch.sum(weights.unsqueeze(2) * components, dim=1)
+        return F.normalize(fused, dim=1)
+
     def _class_prototypes(self, exemplar_z, topk, alpha,
                           extra_exemplar_z=None):
-        exemplar_z = F.normalize(exemplar_z, dim=1)
-        if extra_exemplar_z is not None:
-            if extra_exemplar_z.dim() != 3:
-                raise ValueError(
-                    'Extra exemplar embeddings must have shape [C, R, D]')
-            expected = (
-                exemplar_z.size(0), extra_exemplar_z.size(1),
-                exemplar_z.size(1))
-            if tuple(extra_exemplar_z.shape) != expected:
-                raise ValueError(
-                    'Extra exemplar embeddings do not align with anchors')
-            extra_exemplar_z = F.normalize(extra_exemplar_z, dim=2)
+        # Build the label-only prototype first. It becomes the actual anchor
+        # for both the Q0 ablation and P1 queue-neighbor competition.
+        exemplar_z = self._fuse_labeled_exemplars(
+            exemplar_z, extra_exemplar_z)
 
         filled = int(self.queue_filled.item())
         neighbor_count = min(max(int(topk), 0), filled)
@@ -314,8 +336,6 @@ class OSEResA(nn.Module):
         for class_index in range(exemplar_z.size(0)):
             component_groups = [
                 exemplar_z[class_index:class_index + 1]]
-            if extra_exemplar_z is not None:
-                component_groups.append(extra_exemplar_z[class_index])
             if neighbor_count > 0:
                 selected = neighbor_indices[class_index][
                     neighbor_valid[class_index]]

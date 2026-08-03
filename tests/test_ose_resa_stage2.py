@@ -23,6 +23,23 @@ class _MemoryDataset(object):
         return len(self.label)
 
 
+class _ExemplarDataset(object):
+
+    def __init__(self, count=3):
+        values = np.arange(
+            count * 3 * 4 * 25, dtype=np.float32)
+        self.data = values.reshape(count, 3, 4, 25, 1)
+        self.label = list(range(count))
+        self.augmentation_calls = 0
+
+    def __len__(self):
+        return len(self.label)
+
+    def _aug(self, sample):
+        self.augmentation_calls += 1
+        return sample + 1.0
+
+
 class _LogSink(object):
 
     def __init__(self):
@@ -165,6 +182,27 @@ class OSEResAStage2Test(unittest.TestCase):
         self.assertAlmostEqual(groups['backbone']['lr'], 0.005)
         self.assertAlmostEqual(groups['head']['lr'], 0.125)
         self.assertEqual(processor.iter_info['head_lr'], '0.125000')
+
+    def test_exemplar_modalities_share_one_augmentation_draw(self):
+        processor = OSEResAStage2Processor.__new__(
+            OSEResAStage2Processor)
+        dataset = _ExemplarDataset()
+        processor.data_loader = {
+            'train': types.SimpleNamespace(dataset=dataset)}
+        processor.ose_exemplar_indices = [0, 1, 2]
+        processor.ose_exemplar_modalities = ('joint', 'motion', 'bone')
+        processor.arg = types.SimpleNamespace(
+            stream='joint', ose_exemplar_views=1)
+        processor.dev = 'cpu'
+
+        joint, motion, bone = processor._exemplar_batches()
+
+        self.assertEqual(dataset.augmentation_calls, 3)
+        self.assertTrue(torch.allclose(
+            motion[:, :, :-1], joint[:, :, 1:] - joint[:, :, :-1]))
+        self.assertTrue(torch.count_nonzero(motion[:, :, -1]).item() == 0)
+        self.assertTrue(torch.allclose(
+            bone[:, :, :, 0], joint[:, :, :, 0] - joint[:, :, :, 1]))
 
 
 if __name__ == '__main__':

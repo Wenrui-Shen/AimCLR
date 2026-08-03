@@ -1,5 +1,5 @@
-work_dir: ./data/ntu60_cs/aimclr_to_native_ose_resa_a3_p1_q4_mf_100ep_joint/linear_eval
-weights: ./data/ntu60_cs/aimclr_to_native_ose_resa_a3_p1_q4_mf_100ep_joint/pretext/epoch100_model.pt
+work_dir: ./data/ntu60_cs/aimclr_to_native_ose_resa_a4_jmb_p1_q4_mf_100ep_joint/linear_eval
+weights: ./data/ntu60_cs/aimclr_to_native_ose_resa_a4_jmb_p1_q4_mf_100ep_joint/pretext/epoch100_model.pt
 ignore_weights: [encoder_q.fc, encoder_k, projector_q, projector_k, predictor, queue]
 
 train_feeder: feeder.ntu_feeder.Feeder_single

@@ -27,6 +27,29 @@ class OSEResAProcessor(PT_Processor):
     """ST-GCN pretraining with ReSA and the OSE losses."""
 
     def load_model(self):
+        modalities = self.arg.ose_exemplar_modalities
+        if isinstance(modalities, str):
+            modalities = [modalities]
+        modalities = tuple(str(name).lower() for name in modalities)
+        supported_modalities = ('joint', 'motion', 'bone')
+        if not modalities:
+            raise ValueError(
+                'ose_exemplar_modalities must contain at least one stream')
+        unknown_modalities = [
+            name for name in modalities
+            if name not in supported_modalities
+        ]
+        if unknown_modalities:
+            raise ValueError(
+                'Unsupported exemplar modalities: {}'.format(
+                    unknown_modalities))
+        if len(set(modalities)) != len(modalities):
+            raise ValueError('ose_exemplar_modalities must not repeat')
+        if self.arg.ose_enabled and self.arg.stream not in modalities:
+            raise ValueError(
+                'The training stream {} must be included in '
+                'ose_exemplar_modalities'.format(self.arg.stream))
+        self.ose_exemplar_modalities = modalities
         if self.arg.ose_mix_proto_weight < 0:
             raise ValueError('ose_mix_proto_weight must be non-negative')
         if self.arg.ose_mix_ins_weight < 0:
@@ -98,6 +121,14 @@ class OSEResAProcessor(PT_Processor):
                     self.arg.ose_topk,
                     self.arg.ose_exemplar_views,
                     self.arg.ose_exemplar_views - 1))
+            ema_modalities = [
+                name for name in self.ose_exemplar_modalities
+                if name != self.arg.stream
+            ]
+            self.io.print_log(
+                'OSE labeled modalities | online {} | EMA extras {}'.format(
+                    self.arg.stream,
+                    ','.join(ema_modalities) if ema_modalities else 'none'))
         if queue_contrast_enabled:
             self.io.print_log(
                 'Corrected weak queue | weight {:.1f} | dim {} | size {} | '
@@ -258,15 +289,16 @@ class OSEResAProcessor(PT_Processor):
             raise ValueError('Unsupported ReSA batch format')
         return data_pack, label, index
 
-    def _prepare_stream(self, data):
-        if self.arg.stream == 'joint':
+    def _prepare_stream(self, data, stream=None):
+        stream = self.arg.stream if stream is None else stream
+        if stream == 'joint':
             return data
-        if self.arg.stream == 'motion':
+        if stream == 'motion':
             motion = torch.zeros_like(data)
             motion[:, :, :-1, :, :] = (
                 data[:, :, 1:, :, :] - data[:, :, :-1, :, :])
             return motion
-        if self.arg.stream == 'bone':
+        if stream == 'bone':
             bone_pairs = [
                 (1, 2), (2, 21), (3, 21), (4, 3), (5, 21),
                 (6, 5), (7, 6), (8, 7), (9, 21), (10, 9),
@@ -280,9 +312,9 @@ class OSEResAProcessor(PT_Processor):
                     data[:, :, :, v1 - 1, :] -
                     data[:, :, :, v2 - 1, :])
             return bone
-        raise ValueError('Unknown stream: {}'.format(self.arg.stream))
+        raise ValueError('Unknown stream: {}'.format(stream))
 
-    def _exemplar_batch(self):
+    def _raw_exemplar_batch(self):
         dataset = self.data_loader['train'].dataset
         samples = []
         for index in self.ose_exemplar_indices:
@@ -292,13 +324,30 @@ class OSEResAProcessor(PT_Processor):
             samples.append(sample)
         exemplars = torch.from_numpy(np.stack(samples, axis=0)).float()
         exemplars = exemplars.to(self.dev, non_blocking=True)
-        return self._prepare_stream(exemplars)
+        return exemplars
+
+    def _exemplar_batch(self, stream=None):
+        return self._prepare_stream(
+            self._raw_exemplar_batch(), stream=stream)
 
     def _exemplar_batches(self):
-        return [
-            self._exemplar_batch()
-            for _ in range(self.arg.ose_exemplar_views)
-        ]
+        # Derive all structural modalities from the same augmented exemplar;
+        # otherwise random augmentation would be confounded with modality.
+        raw_exemplars = self._raw_exemplar_batch()
+        batches = [self._prepare_stream(
+            raw_exemplars, stream=self.arg.stream)]
+        batches.extend([
+            self._prepare_stream(raw_exemplars, stream=modality)
+            for modality in self.ose_exemplar_modalities
+            if modality != self.arg.stream
+        ])
+        # Preserve the older independent-view option in addition to the new
+        # deterministic structural modalities.
+        batches.extend([
+            self._exemplar_batch(stream=self.arg.stream)
+            for _ in range(self.arg.ose_exemplar_views - 1)
+        ])
+        return batches
 
     def _training_progress(self, epoch, batch_index, num_batches):
         return (epoch - 1) + float(batch_index + 1) / max(num_batches, 1)
@@ -560,6 +609,11 @@ class OSEResAProcessor(PT_Processor):
         parser.add_argument(
             '--ose_exemplar_views', type=int, default=1,
             help='total weak exemplar views: one online plus EMA views')
+        parser.add_argument(
+            '--ose_exemplar_modalities', type=str, nargs='+',
+            default=['joint'],
+            help='labeled exemplar streams; training stream is online and '
+                 'the remaining streams are EMA structural views')
         parser.add_argument('--ose_alpha', type=float, default=0.75)
         parser.add_argument('--ose_tau_s', type=float, default=0.1)
         parser.add_argument('--ose_tau_t', type=float, default=0.04)

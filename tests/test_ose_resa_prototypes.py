@@ -144,6 +144,56 @@ class ReSAOSEPrototypeStageTest(unittest.TestCase):
         self.assertEqual(overlap.item(), 0.0)
         self.assertTrue(torch.any(selected < 0))
 
+    def test_multimodal_label_prototype_is_used_without_neighbors(self):
+        model = self._model(stage=1)
+        extra = torch.tensor([
+            [[0.8, 0.6, 0.0], [0.8, 0.0, 0.6]],
+            [[0.6, 0.8, 0.0], [0.0, 0.8, 0.6]],
+            [[0.6, 0.0, 0.8], [0.0, 0.6, 0.8]],
+        ])
+        expected = model._fuse_labeled_exemplars(
+            self.exemplar, extra)
+
+        prototypes, selected, counts, overlap = model._class_prototypes(
+            self.exemplar, topk=0, alpha=self.alpha,
+            extra_exemplar_z=extra)
+
+        self.assertTrue(torch.allclose(prototypes, expected))
+        self.assertEqual(tuple(selected.shape), (3, 0))
+        self.assertTrue(torch.equal(counts, torch.ones(3, dtype=torch.long)))
+        self.assertEqual(overlap.item(), 0.0)
+        self.assertTrue(torch.allclose(
+            prototypes.norm(dim=1), torch.ones(3), atol=1e-6))
+
+    def test_multimodal_label_prototype_guides_neighbor_selection(self):
+        model = self._model(stage=1)
+        self._fill_queue(model, self.memory)
+        extra = torch.tensor([
+            [[0.8, 0.6, 0.0], [0.8, 0.0, 0.6]],
+            [[0.6, 0.8, 0.0], [0.0, 0.8, 0.6]],
+            [[0.6, 0.0, 0.8], [0.0, 0.6, 0.8]],
+        ])
+        fused = model._fuse_labeled_exemplars(self.exemplar, extra)
+        memory = F.normalize(self.memory, dim=1)
+        similarity = fused @ memory.t()
+        other_similarity = similarity.unsqueeze(0).expand(
+            fused.size(0), -1, -1).clone()
+        diagonal = torch.eye(fused.size(0), dtype=torch.bool)
+        other_similarity[diagonal] = -float('inf')
+        score = (
+            self.alpha * similarity -
+            (1.0 - self.alpha) * other_similarity.max(dim=1)[0])
+        owner = score.argmax(dim=0)
+
+        _, selected, _, _ = model._class_prototypes(
+            self.exemplar, topk=4, alpha=self.alpha,
+            extra_exemplar_z=extra)
+
+        for class_index in range(fused.size(0)):
+            valid = selected[class_index][selected[class_index] >= 0]
+            if valid.numel() > 0:
+                self.assertTrue(torch.all(owner[valid] == class_index))
+
     def test_p2_uses_competition_scores_for_aggregation(self):
         p1 = self._model(stage=1)
         p2 = self._model(stage=2)
