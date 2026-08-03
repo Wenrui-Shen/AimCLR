@@ -1,14 +1,12 @@
-work_dir: ./data/ntu60_cs/aimclr_to_ose_resa_a3_p1_q4_mf_300ep_joint/pretext
+work_dir: ./data/ntu60_cs/aimclr_to_native_ose_resa_a3_p1_q4_mf_100ep_joint/pretext
 
-# Stage1 is frozen only at the transition boundary: its online backbone and
-# 128-d MLP initialize both Stage2 branches. AimCLR's contrastive queue is not
-# transferred.
+# Only the default AimCLR online backbone initializes Stage2. ReSA/OSE uses
+# its native projector and predictor; the AimCLR head and queue are discarded.
 stage1_weights: ./data/ntu60_cs/aimclr_joint/pretext/epoch300_model.pt
-stage2_load_projector: True
-stage2_prefill_queue: True
-stage2_prefill_augmented: True
-stage2_prefill_seed: 0
-stage2_prefill_batch_size: 128
+stage2_load_projector: False
+stage2_prefill_queue: False
+stage2_head_lr: 0.25
+stage2_head_final_lr: 0.0
 
 train_feeder: feeder.ose_resa_feeder.Feeder
 train_feeder_args:
@@ -25,10 +23,11 @@ model: net.ose_resa.OSEResA
 model_args:
   base_encoder: net.st_gcn.Model
   pretrain: True
-  # Exact AimCLR head layout: Linear(256,256)-ReLU-Linear(256,128).
-  feature_dim: 128
-  projector_type: aimclr
-  use_predictor: False
+  feature_dim: 256
+  projector_type: resa
+  projector_hidden_dim: 2048
+  projector_layers: 3
+  use_predictor: True
   queue_size: 8192
   cluster_temperature: 0.4
   sinkhorn_temperature: 0.05
@@ -45,7 +44,7 @@ model_args:
 
 nesterov: False
 weight_decay: 1e-5
-base_lr: 0.01
+base_lr: 0.25
 resa_final_lr: 0.0
 resa_warmup_epoch: 0
 resa_momentum: 0.996
@@ -54,7 +53,7 @@ optimizer: SGD
 device: [0]
 batch_size: 128
 test_batch_size: 128
-num_epoch: 300
+num_epoch: 100
 start_epoch: 0
 stream: 'joint'
 

@@ -132,7 +132,40 @@ class OSEResAStage2Test(unittest.TestCase):
             torch.ones(4), atol=1e-6))
         self.assertTrue(processor.model.training)
 
+    def test_native_stage2_uses_separate_backbone_and_head_lrs(self):
+        processor = OSEResAStage2Processor.__new__(
+            OSEResAStage2Processor)
+        processor.model = OSEResA(
+            base_encoder='tests.test_ose_resa_lmix.TinyEncoder',
+            pretrain=True,
+            feature_dim=6,
+            projector_hidden_dim=12,
+            projector_layers=2,
+            projector_type='resa',
+            use_predictor=True,
+            hidden_dim=8,
+            num_class=3)
+        for parameter in processor.model.encoder_q.fc.parameters():
+            parameter.requires_grad = False
+        processor.arg = types.SimpleNamespace(
+            optimizer='SGD', base_lr=0.01, stage2_head_lr=0.25,
+            resa_final_lr=0.0, stage2_head_final_lr=0.0,
+            resa_warmup_epoch=0, num_epoch=100,
+            nesterov=False, weight_decay=1e-5)
+        processor.io = _LogSink()
+        processor.iter_info = {}
+
+        processor.load_optimizer()
+        processor._set_learning_rate(progress=50.0)
+
+        groups = {
+            group['stage2_role']: group
+            for group in processor.optimizer.param_groups
+        }
+        self.assertAlmostEqual(groups['backbone']['lr'], 0.005)
+        self.assertAlmostEqual(groups['head']['lr'], 0.125)
+        self.assertEqual(processor.iter_info['head_lr'], '0.125000')
+
 
 if __name__ == '__main__':
     unittest.main()
-

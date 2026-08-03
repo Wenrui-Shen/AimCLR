@@ -1,10 +1,12 @@
 import argparse
+import math
 import os
 import random
 from collections import OrderedDict
 
 import numpy as np
 import torch
+import torch.optim as optim
 from torchlight import str2bool
 
 from .pretrain_ose_resa import OSEResAProcessor
@@ -110,7 +112,95 @@ class OSEResAStage2Processor(OSEResAProcessor):
         super().load_model()
         if self.arg.stage2_prefill_batch_size <= 0:
             raise ValueError('stage2_prefill_batch_size must be positive')
+        if self.arg.stage2_head_lr <= 0:
+            raise ValueError('stage2_head_lr must be positive')
+        if self.arg.stage2_head_final_lr < 0:
+            raise ValueError('stage2_head_final_lr must be non-negative')
+        # The ST-GCN classifier is bypassed by forward_features throughout
+        # pretraining. Keep it out of the Stage2 optimizer explicitly.
+        for parameter in self.model.encoder_q.fc.parameters():
+            parameter.requires_grad = False
         self._stage2_resumed = False
+
+    def load_optimizer(self):
+        backbone_parameters = []
+        head_parameters = []
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if name.startswith('module.'):
+                name = name[len('module.'):]
+            if name.startswith('encoder_q.'):
+                backbone_parameters.append(parameter)
+            else:
+                head_parameters.append(parameter)
+        if not backbone_parameters:
+            raise ValueError('Stage2 optimizer found no online backbone')
+        if not head_parameters:
+            raise ValueError('Stage2 optimizer found no trainable head')
+
+        parameter_groups = [
+            {
+                'params': backbone_parameters,
+                'lr': self.arg.base_lr,
+                'stage2_role': 'backbone',
+            },
+            {
+                'params': head_parameters,
+                'lr': self.arg.stage2_head_lr,
+                'stage2_role': 'head',
+            },
+        ]
+        if self.arg.optimizer == 'SGD':
+            self.optimizer = optim.SGD(
+                parameter_groups, lr=self.arg.base_lr, momentum=0.9,
+                nesterov=self.arg.nesterov,
+                weight_decay=self.arg.weight_decay)
+        elif self.arg.optimizer == 'Adam':
+            self.optimizer = optim.Adam(
+                parameter_groups, lr=self.arg.base_lr,
+                weight_decay=self.arg.weight_decay)
+        else:
+            raise ValueError(
+                'Unsupported optimizer: {}'.format(self.arg.optimizer))
+        self.io.print_log(
+            'Stage2 optimizer | backbone lr {:.6f} | head lr {:.6f}'.format(
+                self.arg.base_lr, self.arg.stage2_head_lr))
+
+    def _scheduled_lr(self, initial_lr, final_lr, progress):
+        warmup = float(self.arg.resa_warmup_epoch)
+        if warmup > 0 and progress <= warmup:
+            return float(initial_lr) * progress / warmup
+        decay_progress = (progress - warmup) / max(
+            self.arg.num_epoch - warmup, 1.0)
+        decay_progress = min(max(decay_progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+        return (float(final_lr) +
+                (float(initial_lr) - float(final_lr)) * cosine)
+
+    def _set_learning_rate(self, progress):
+        backbone_lr = self._scheduled_lr(
+            self.arg.base_lr, self.arg.resa_final_lr, progress)
+        head_lr = self._scheduled_lr(
+            self.arg.stage2_head_lr,
+            self.arg.stage2_head_final_lr, progress)
+        for param_group in self.optimizer.param_groups:
+            role = param_group.get('stage2_role')
+            if role == 'backbone':
+                param_group['lr'] = backbone_lr
+            elif role == 'head':
+                param_group['lr'] = head_lr
+            else:
+                raise ValueError(
+                    'Unknown Stage2 optimizer group: {}'.format(role))
+        self.lr = backbone_lr
+        self.head_lr = head_lr
+        self.iter_info['head_lr'] = '{:.6f}'.format(head_lr)
+
+    def train_log_writer(self, epoch):
+        super().train_log_writer(epoch)
+        self.train_writer.add_scalar(
+            'head_lr', self.head_lr, self.global_step)
 
     def load_weights(self):
         # ``weights`` remains available for resuming a full Stage2 model.  A
@@ -235,5 +325,7 @@ class OSEResAStage2Processor(OSEResAProcessor):
         parser.add_argument('--stage2_prefill_seed', type=int, default=0)
         parser.add_argument(
             '--stage2_prefill_batch_size', type=int, default=128)
+        parser.add_argument('--stage2_head_lr', type=float, default=0.01)
+        parser.add_argument(
+            '--stage2_head_final_lr', type=float, default=0.0)
         return parser
-

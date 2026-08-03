@@ -1,27 +1,30 @@
 # AimCLR / ReSA / OSE 研究交接
 
-最后更新：2026-08-02。本文写给一个完全没有上下文的新会话；不要依赖旧聊天记录。
+最后更新：2026-08-03。本文写给一个完全没有上下文的新会话；不要依赖旧聊天记录。
 
-## 0. 2026-08-02 A3 二阶段主线覆盖说明
+## 0. 2026-08-03 A3 native 二阶段主线覆盖说明
 
 A2 线性评估只有 `73.79`，说明在同一阶段把 OSE 类别收缩与 AimCLR
-memory-bank instance discrimination 强行合并仍然存在明显目标冲突。当前新增 A3：
+memory-bank instance discrimination 强行合并仍然存在明显目标冲突。A3 首版
+平滑迁移模型在 epoch50/100 得到 `76.26`，epoch300 得到 `75.96`，相比
+Stage1 `75.27` 提升有限。当前 A3 已改为 native ReSA+OSE P1：
 
 ```text
 Stage1: 完全默认 AimCLR (`pretext_aimclr_xsub_joint.yaml`), 300 epochs
-Stage2: ReSA + OSE P1 Q4 M-F, 300 epochs
+Stage2: native ReSA + OSE P1 Q4 M-F, 100 epochs
 ```
 
 Stage2 的具体过渡语义：
 
 - 从 AimCLR checkpoint 的 `encoder_q` 加载 backbone；
-- 把 AimCLR `encoder_q.fc` 的 `256 -> 256 -> 128` MLP 原样迁移为
-  Stage2 的 ReSA/OSE 共用 projector；
-- online 参数加载完成后复制到 EMA 分支，Stage2 起点两支严格一致；
+- 不迁移 AimCLR `encoder_q.fc`，Stage2 恢复 native ReSA 的
+  `256 -> 2048 -> 2048 -> 256` projector 和 predictor；
+- online backbone 和随机初始化的 native ReSA head 分别复制到 EMA 分支，
+  Stage2 起点两支严格一致；
 - 不迁移 AimCLR queue、NNM、DDM 或任何 memory-bank 对比损失；
-- ReSA predictor 在 A3 首版关闭，避免引入随机 head；
-- 在第一次优化前，用迁移后的 EMA encoder-projector 和固定 seed 的 weak
-  views 离线填满 OSE queue，并排除 one-shot exemplars；
+- 不离线预填随机 projector 产生的无意义 OSE feature；queue 在训练中自然填充；
+- 主实验的 backbone、projector 和 predictor 共用 cosine `0.25 -> 0`；
+  `stage2_head_lr` 仍保留为配置开关，仅用于分组学习率消融；
 - Stage2 只优化 `LReSA + Lproto + Lmix-proto + Lmix-ins`；
 - prototype 固定使用最佳 P1 互斥 Q4，其他 P0/P2/P3 配置不恢复。
 
