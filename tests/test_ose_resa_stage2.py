@@ -204,6 +204,52 @@ class OSEResAStage2Test(unittest.TestCase):
         self.assertTrue(torch.allclose(
             bone[:, :, :, 0], joint[:, :, :, 0] - joint[:, :, :, 1]))
 
+    def test_dual_projector_gradient_diagnostic_localizes_conflict(self):
+        processor = OSEResAStage2Processor.__new__(
+            OSEResAStage2Processor)
+        processor.model = OSEResA(
+            base_encoder='tests.test_ose_resa_lmix.TinyEncoder',
+            pretrain=True,
+            feature_dim=6,
+            projector_hidden_dim=12,
+            projector_layers=2,
+            projector_type='resa',
+            use_predictor=True,
+            ose_enabled=True,
+            ose_separate_projector=True,
+            queue_size=8,
+            hidden_dim=8,
+            num_class=3,
+            dropout=0.0)
+        processor.arg = types.SimpleNamespace(
+            stage2_diagnostics=True,
+            stage2_diagnostic_gradients=True)
+        view_a = torch.randn(4, 3, 4, 5, 1)
+        view_b = torch.randn(4, 3, 4, 5, 1)
+        exemplar = torch.randn(3, 3, 4, 5, 1)
+        losses = processor.model(
+            view_a, view_b, exemplar, ose_topk=0,
+            sample_indices=torch.arange(4))
+
+        diagnostic = processor._diagnostics_before_backward(
+            0, losses['cluster'], losses['proto'])
+        self.assertTrue(np.isfinite(diagnostic['encoder_grad_cos']))
+        self.assertTrue(np.isnan(
+            diagnostic['shared_projector_grad_cos']))
+        self.assertGreater(
+            diagnostic['resa_projector_grad_norm'], 0.0)
+        self.assertGreater(
+            diagnostic['ose_projector_grad_norm'], 0.0)
+
+        processor.model.zero_grad()
+        (losses['cluster'] + losses['proto']).backward()
+        actual = processor._diagnostics_after_backward(0)
+        self.assertGreater(actual['actual_encoder_grad_norm'], 0.0)
+        self.assertGreater(
+            actual['actual_resa_projector_grad_norm'], 0.0)
+        self.assertGreater(
+            actual['actual_ose_projector_grad_norm'], 0.0)
+
 
 if __name__ == '__main__':
     unittest.main()

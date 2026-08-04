@@ -1,6 +1,47 @@
 # AimCLR / ReSA / OSE 研究交接
 
-最后更新：2026-08-03。本文写给一个完全没有上下文的新会话；不要依赖旧聊天记录。
+最后更新：2026-08-04。本文写给一个完全没有上下文的新会话；不要依赖旧聊天记录。
+
+## 0. 2026-08-04 A5 Stage2 损失归因与 projector 耦合实验
+
+当前不引入 warm-up，也暂不迁移其他 baseline。A5 只在同一个 AimCLR
+Stage1 checkpoint、100-epoch Stage2、统一 `lr=0.25` 和 JMB Q0 条件下回答：
+
+1. ReSA 与 OSE 各自贡献多少；
+2. 两项损失的冲突主要发生在共享 encoder 还是共享 projector；
+3. 随机初始化的 native ReSA projector 是否逐步继承 Stage1 encoder 的关系结构。
+
+新增三个对照和一个可复现的共享-head参照：
+
+```text
+ReSA-only:  resa_weight=1, ose_enabled=False
+OSE-only:   resa_weight=0, ose_enabled=True, JMB Q0 M-F
+Shared:     resa_weight=1, ose_enabled=True, JMB Q0 M-F
+Dual-proj:  ReSA/OSE 使用独立但同初始化的 online/EMA projector，encoder 共享
+```
+
+ReSA-only 通过 `ose_match_exemplar_split=True` 排除与 OSE 实验完全相同的60个
+exemplar，避免数据量差异污染归因。OSE-only仍前向计算ReSA关系值用于诊断，但
+`resa_weight=0`，ReSA不产生任何实际优化梯度。
+
+双projector只分开heads，不增加backbone前向：ReSA继续使用
+`projector_q/k + predictor`；OSE的exemplar、prototype、mix和queue全部进入
+`ose_projector_q/k`。两个online projector从完全相同的随机权重开始，随后独立
+更新，因此差异只来自参数是否共享。
+
+每个pretext工作目录自动生成 `stage2_diagnostics.csv`，每epoch一行。主要列：
+
+- `mean_cluster_kl`、`mean_encoder_resa_relation_cos`：Stage1 H到新ReSA Z/Q的适配；
+- `first_batch_encoder_grad_cos`：ReSA与OSE在共享encoder上的梯度夹角；
+- `first_batch_shared_projector_grad_cos`：共享projector上的直接梯度冲突；
+- `mean_resa_ose_relation_cos`：双head关系空间的分化；
+- 三个feature std/off-diagonal cosine：表示坍塌诊断；
+- encoder/projector/predictor parameter drift：相对Stage2初始点的参数漂移。
+
+梯度诊断只在每epoch第一个batch执行，避免显著增加整轮训练开销。
+
+四组实验可用 `run_stage2_a5_ablation.sh` 串行运行；默认执行全部pretrain和LP，
+参数 `pretrain` 或 `lp` 可只执行对应阶段。
 
 ## 0. 2026-08-03 A4 多流标签原型主线覆盖说明
 

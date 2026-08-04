@@ -63,7 +63,8 @@ class OSEResA(nn.Module):
     def __init__(self, base_encoder=None, pretrain=True, feature_dim=256,
                  projector_hidden_dim=2048, projector_layers=3,
                  projector_type='resa', use_predictor=True,
-                 ose_enabled=True, queue_size=8192,
+                 ose_enabled=True, ose_separate_projector=False,
+                 queue_size=8192,
                  queue_contrast_enabled=False, instance_feature_dim=128,
                  instance_queue_size=32768, instance_temperature=0.07,
                  cluster_temperature=0.4, sinkhorn_temperature=0.05,
@@ -76,6 +77,10 @@ class OSEResA(nn.Module):
         base_encoder = import_class(base_encoder)
         self.pretrain = pretrain
         self.ose_enabled = bool(ose_enabled)
+        self.ose_separate_projector = bool(ose_separate_projector)
+        if self.ose_separate_projector and not self.ose_enabled:
+            raise ValueError(
+                'ose_separate_projector requires OSE to be enabled')
         self.ose_prototype_stage = int(ose_prototype_stage)
         if self.ose_prototype_stage not in (0, 1, 2, 3):
             raise ValueError('ose_prototype_stage must be one of 0, 1, 2, 3')
@@ -107,6 +112,17 @@ class OSEResA(nn.Module):
             projector_type=self.projector_type)
         self.predictor = (_build_predictor(feature_dim, projector_hidden_dim)
                           if use_predictor else nn.Identity())
+        if self.ose_separate_projector:
+            # ReSA keeps projector_q/projector_k and its predictor.  OSE gets
+            # an equally shaped online/EMA projector pair, while both losses
+            # still update the same encoder.  This isolates head-level loss
+            # interference without adding another backbone forward.
+            self.ose_projector_q = _build_projector(
+                hidden_dim, projector_hidden_dim, feature_dim,
+                projector_layers, projector_type=self.projector_type)
+            self.ose_projector_k = _build_projector(
+                hidden_dim, projector_hidden_dim, feature_dim,
+                projector_layers, projector_type=self.projector_type)
 
         self.cluster_temperature = float(cluster_temperature)
         self.sinkhorn_temperature = float(sinkhorn_temperature)
@@ -165,6 +181,19 @@ class OSEResA(nn.Module):
                                     self.projector_k.parameters()):
             param_k.data.copy_(param_q.data)
             param_k.requires_grad = False
+        if self.ose_separate_projector:
+            # Clone the same random Stage2 head into both branches. The
+            # ablation therefore changes parameter sharing only, not the
+            # initial representation space seen by ReSA versus OSE.
+            for shared_q, ose_q in zip(
+                    self.projector_q.parameters(),
+                    self.ose_projector_q.parameters()):
+                ose_q.data.copy_(shared_q.data)
+            for param_q, param_k in zip(
+                    self.ose_projector_q.parameters(),
+                    self.ose_projector_k.parameters()):
+                param_k.data.copy_(param_q.data)
+                param_k.requires_grad = False
         if self.queue_contrast_enabled:
             for param_q, param_k in zip(
                     self.instance_projector_q.parameters(),
@@ -181,6 +210,12 @@ class OSEResA(nn.Module):
         for param_q, param_k in zip(self.projector_q.parameters(),
                                     self.projector_k.parameters()):
             param_k.data.mul_(momentum).add_(param_q.data, alpha=1.0 - momentum)
+        if self.ose_separate_projector:
+            for param_q, param_k in zip(
+                    self.ose_projector_q.parameters(),
+                    self.ose_projector_k.parameters()):
+                param_k.data.mul_(momentum).add_(
+                    param_q.data, alpha=1.0 - momentum)
         if self.queue_contrast_enabled:
             for param_q, param_k in zip(
                     self.instance_projector_q.parameters(),
@@ -517,6 +552,12 @@ class OSEResA(nn.Module):
 
         view_a_projected = self.projector_q(view_a_features)
         view_b_projected = self.projector_q(view_b_features)
+        if self.ose_separate_projector:
+            view_a_ose_projected = self.ose_projector_q(view_a_features)
+            view_b_ose_projected = self.ose_projector_q(view_b_features)
+        else:
+            view_a_ose_projected = view_a_projected
+            view_b_ose_projected = view_b_projected
         view_a_prediction = F.normalize(
             self.predictor(view_a_projected), dim=1)
         view_b_prediction = F.normalize(
@@ -526,26 +567,37 @@ class OSEResA(nn.Module):
                     F.normalize(view_b_features, dim=1)]
         projections = [F.normalize(view_a_projected, dim=1),
                        F.normalize(view_b_projected, dim=1)]
+        ose_projections = [F.normalize(view_a_ose_projected, dim=1),
+                           F.normalize(view_b_ose_projected, dim=1)]
         predictions = [view_a_prediction, view_b_prediction]
         return ([view_a_features, view_b_features], features,
-                projections, predictions)
+                projections, predictions, ose_projections)
 
     def _exemplar_embedding(self, exemplar):
-        return self._online_projection(exemplar)
+        return self._online_projection(exemplar, ose_branch=True)
 
-    def _online_projection(self, view):
+    def _online_projection(self, view, ose_branch=False):
         features = self.encoder_q.forward_features(view)
-        return F.normalize(self.projector_q(features), dim=1)
+        projector = (self.ose_projector_q
+                     if ose_branch and self.ose_separate_projector
+                     else self.projector_q)
+        return F.normalize(projector(features), dim=1)
 
     @torch.no_grad()
     def teacher_projection(self, view):
         """Project a batch with the EMA branch (used for Stage2 prefill)."""
         features = self.encoder_k.forward_features(view)
-        return F.normalize(self.projector_k(features), dim=1)
+        projector = (self.ose_projector_k
+                     if self.ose_separate_projector
+                     else self.projector_k)
+        return F.normalize(projector(features), dim=1)
 
     @torch.no_grad()
     def _teacher_exemplar_projection(self, exemplar):
-        modules = (self.encoder_k, self.projector_k)
+        projector = (self.ose_projector_k
+                     if self.ose_separate_projector
+                     else self.projector_k)
+        modules = (self.encoder_k, projector)
         batch_norm_state = []
         for module in modules:
             for child in module.modules():
@@ -562,7 +614,7 @@ class OSEResA(nn.Module):
                     ))
         try:
             features = self.encoder_k.forward_features(exemplar)
-            projected = self.projector_k(features)
+            projected = projector(features)
         finally:
             for child, running_mean, running_var, batches in batch_norm_state:
                 if running_mean is not None:
@@ -579,11 +631,42 @@ class OSEResA(nn.Module):
         view_b_features = self.encoder_k.forward_features(view_b)
         features = [F.normalize(view_a_features, dim=1),
                     F.normalize(view_b_features, dim=1)]
-        embeddings = [
+        resa_embeddings = [
             F.normalize(self.projector_k(view_a_features), dim=1),
             F.normalize(self.projector_k(view_b_features), dim=1),
         ]
-        return ([view_a_features, view_b_features], features, embeddings)
+        if self.ose_separate_projector:
+            ose_embeddings = [
+                F.normalize(self.ose_projector_k(view_a_features), dim=1),
+                F.normalize(self.ose_projector_k(view_b_features), dim=1),
+            ]
+        else:
+            ose_embeddings = resa_embeddings
+        return ([view_a_features, view_b_features], features,
+                resa_embeddings, ose_embeddings)
+
+    @staticmethod
+    def _off_diagonal_similarity(features):
+        similarity = torch.matmul(features, features.t())
+        if similarity.size(0) <= 1:
+            return similarity.new_tensor(0.0)
+        mask = ~torch.eye(
+            similarity.size(0), dtype=torch.bool, device=similarity.device)
+        return similarity[mask].mean().detach()
+
+    @staticmethod
+    def _relation_cosine(left_features, right_features):
+        left = torch.matmul(left_features, left_features.t())
+        right = torch.matmul(right_features, right_features.t())
+        if left.size(0) > 1:
+            mask = ~torch.eye(
+                left.size(0), dtype=torch.bool, device=left.device)
+            left = left[mask]
+            right = right[mask]
+        else:
+            left = left.flatten()
+            right = right.flatten()
+        return F.cosine_similarity(left, right, dim=0).detach()
 
     def forward(self, view_a, view_b=None, exemplar=None,
                 momentum=0.996, ose_topk=8, ose_alpha=0.75,
@@ -609,7 +692,7 @@ class OSEResA(nn.Module):
             raise ValueError(
                 'Mixed inputs were provided while both Lmix terms are disabled')
 
-        online_raw_h, online_h, online_z, online_q = (
+        online_raw_h, online_h, online_z, online_q, online_ose_z = (
             self._online_embeddings(view_a, view_b))
         if self.ose_enabled:
             if exemplar is None:
@@ -626,8 +709,8 @@ class OSEResA(nn.Module):
                         'All exemplar views must contain the same classes')
         with torch.no_grad():
             self._momentum_update(momentum)
-            teacher_raw_h, teacher_h, teacher_z = self._teacher_embeddings(
-                view_a, view_b)
+            (teacher_raw_h, teacher_h, teacher_z,
+             teacher_ose_z) = self._teacher_embeddings(view_a, view_b)
             if self.ose_enabled and extra_exemplar_views:
                 extra_exemplar_z = torch.stack([
                     self._teacher_exemplar_projection(extra_view)
@@ -639,6 +722,8 @@ class OSEResA(nn.Module):
         assignment = self._sinkhorn_knopp(
             torch.matmul(online_h[0].detach(), teacher_h[0].t()))
         cluster_loss = online_q[0].new_tensor(0.0)
+        relation_cosines = []
+        relation_top1 = []
         terms = 0
         for online_index in range(len(online_q)):
             for teacher_index in range(len(teacher_z)):
@@ -649,16 +734,47 @@ class OSEResA(nn.Module):
                 logits = logits / max(self.cluster_temperature, 1e-12)
                 cluster_loss = cluster_loss + self._soft_cross_entropy(
                     logits, assignment)
+                with torch.no_grad():
+                    predicted_relation = torch.softmax(logits, dim=1)
+                    relation_cosines.append(F.cosine_similarity(
+                        predicted_relation.flatten(), assignment.flatten(),
+                        dim=0))
+                    relation_top1.append((
+                        predicted_relation.argmax(dim=1) ==
+                        assignment.argmax(dim=1)).float().mean())
                 terms += 1
         cluster_loss = cluster_loss / max(terms, 1)
         cluster_entropy = -(
             assignment * assignment.clamp_min(1e-12).log()
         ).sum(dim=1).mean()
+        relation_target_pred_cos = torch.stack(relation_cosines).mean()
+        relation_top1_agreement = torch.stack(relation_top1).mean()
 
         result = {
             'cluster': cluster_loss,
             'cluster_entropy': cluster_entropy,
             'cluster_kl': cluster_loss - cluster_entropy,
+            # Transition diagnostics: H is the transferred Stage1 encoder
+            # space, while Z/Q belongs to the newly initialized Stage2 head.
+            'encoder_feature_std': online_h[1].std(dim=0).mean().detach(),
+            'resa_projector_feature_std': (
+                online_z[1].std(dim=0).mean().detach()),
+            'ose_projector_feature_std': (
+                online_ose_z[1].std(dim=0).mean().detach()),
+            'encoder_offdiag_cos': self._off_diagonal_similarity(
+                online_h[1]),
+            'resa_projector_offdiag_cos': self._off_diagonal_similarity(
+                online_z[1]),
+            'ose_projector_offdiag_cos': self._off_diagonal_similarity(
+                online_ose_z[1]),
+            'encoder_resa_relation_cos': self._relation_cosine(
+                online_h[1], online_z[1]),
+            'encoder_ose_relation_cos': self._relation_cosine(
+                online_h[1], online_ose_z[1]),
+            'resa_ose_relation_cos': self._relation_cosine(
+                online_z[1], online_ose_z[1]),
+            'relation_target_pred_cos': relation_target_pred_cos,
+            'relation_top1_agreement': relation_top1_agreement,
         }
         if not self.ose_enabled:
             return result
@@ -668,9 +784,9 @@ class OSEResA(nn.Module):
              exemplar_z, topk=ose_topk, alpha=ose_alpha,
              extra_exemplar_z=extra_exemplar_z)
         student_logits = torch.matmul(
-            online_z[1], prototypes.t()) / max(float(ose_tau_s), 1e-12)
+            online_ose_z[1], prototypes.t()) / max(float(ose_tau_s), 1e-12)
         teacher_logits = torch.matmul(
-            teacher_z[0].detach(), prototypes.detach().t()) / max(
+            teacher_ose_z[0].detach(), prototypes.detach().t()) / max(
                 float(ose_tau_t), 1e-12)
         teacher_target = torch.softmax(teacher_logits, dim=1).detach()
         align_loss = self._soft_cross_entropy(student_logits, teacher_target)
@@ -706,16 +822,16 @@ class OSEResA(nn.Module):
         mix_proto_loss = proto_loss.new_tensor(0.0)
         mix_ins_loss = proto_loss.new_tensor(0.0)
         if compute_mix:
-            if mixed_view.size(0) != online_z[1].size(0):
+            if mixed_view.size(0) != online_ose_z[1].size(0):
                 raise ValueError(
                     'Mixed view batch size must match the unlabeled views')
             mix_index = mix_index.detach().to(
-                device=online_z[1].device, dtype=torch.long).view(-1)
-            if mix_index.numel() != online_z[1].size(0):
+                device=online_ose_z[1].device, dtype=torch.long).view(-1)
+            if mix_index.numel() != online_ose_z[1].size(0):
                 raise ValueError(
                     'Mix permutation size must match the batch size')
             if (mix_index.min().item() < 0 or
-                    mix_index.max().item() >= online_z[1].size(0)):
+                mix_index.max().item() >= online_ose_z[1].size(0)):
                 raise ValueError('Mix permutation contains invalid indices')
             mix_beta = float(mix_beta)
             if not 0.0 <= mix_beta <= 1.0:
@@ -723,7 +839,7 @@ class OSEResA(nn.Module):
 
             # The mixed branch remains in encoder-projector space. It does not
             # use the ReSA predictor, participate in Sinkhorn, or enter the queue.
-            mixed_z = self._online_projection(mixed_view)
+            mixed_z = self._online_projection(mixed_view, ose_branch=True)
             if compute_mix_proto:
                 mixed_logits = torch.matmul(
                     mixed_z, prototypes.t()) / max(
@@ -738,7 +854,7 @@ class OSEResA(nn.Module):
 
             if compute_mix_ins:
                 instance_logits = torch.matmul(
-                    mixed_z, teacher_z[0].detach().t()) / max(
+                    mixed_z, teacher_ose_z[0].detach().t()) / max(
                         float(ose_tau_s), 1e-12)
                 instance_log_prob = F.log_softmax(instance_logits, dim=1)
                 row = torch.arange(
@@ -752,7 +868,7 @@ class OSEResA(nn.Module):
         target_entropy = -(
             teacher_target * teacher_target.clamp_min(1e-12).log()
         ).sum(dim=1).mean()
-        self._dequeue_and_enqueue(teacher_z[0], sample_indices)
+        self._dequeue_and_enqueue(teacher_ose_z[0], sample_indices)
         if self.queue_contrast_enabled:
             self._dequeue_and_enqueue_instance(
                 instance_key, instance_category, instance_confidence)

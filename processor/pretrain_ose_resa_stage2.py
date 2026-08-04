@@ -1,4 +1,5 @@
 import argparse
+import csv
 import math
 import os
 import random
@@ -18,6 +19,36 @@ _AIMCLR_PROJECTOR_MAP = OrderedDict([
     ('encoder_q.fc.2.weight', 'projector_q.2.weight'),
     ('encoder_q.fc.2.bias', 'projector_q.2.bias'),
 ])
+
+
+_STAGE2_MEAN_METRICS = (
+    'loss', 'cluster', 'cluster_entropy', 'cluster_kl', 'proto', 'align',
+    'disp', 'align_kl', 'mix_proto', 'mix_ins', 'target_entropy',
+    'encoder_feature_std', 'resa_projector_feature_std',
+    'ose_projector_feature_std', 'encoder_offdiag_cos',
+    'resa_projector_offdiag_cos', 'ose_projector_offdiag_cos',
+    'encoder_resa_relation_cos', 'encoder_ose_relation_cos',
+    'resa_ose_relation_cos', 'relation_target_pred_cos',
+    'relation_top1_agreement',
+)
+
+_STAGE2_GRADIENT_METRICS = (
+    'resa_encoder_grad_norm', 'ose_encoder_grad_norm',
+    'encoder_grad_cos', 'resa_projector_grad_norm',
+    'ose_projector_grad_norm', 'shared_projector_grad_cos',
+    'resa_predictor_grad_norm', 'actual_encoder_grad_norm',
+    'actual_resa_projector_grad_norm',
+    'actual_ose_projector_grad_norm', 'actual_predictor_grad_norm',
+)
+
+_STAGE2_DIAGNOSTIC_FIELDS = (
+    'epoch', 'training_mode', 'ose_enabled', 'separate_projector',
+    'resa_weight', 'batches', 'backbone_lr', 'head_lr',
+) + tuple('mean_' + name for name in _STAGE2_MEAN_METRICS) + tuple(
+    'first_batch_' + name for name in _STAGE2_GRADIENT_METRICS) + (
+    'encoder_param_drift', 'resa_projector_param_drift',
+    'ose_projector_param_drift', 'predictor_param_drift',
+)
 
 
 def _unwrap_state_dict(checkpoint):
@@ -116,11 +147,14 @@ class OSEResAStage2Processor(OSEResAProcessor):
             raise ValueError('stage2_head_lr must be positive')
         if self.arg.stage2_head_final_lr < 0:
             raise ValueError('stage2_head_final_lr must be non-negative')
+        if not self.arg.stage2_diagnostic_filename:
+            raise ValueError('stage2_diagnostic_filename must not be empty')
         # The ST-GCN classifier is bypassed by forward_features throughout
         # pretraining. Keep it out of the Stage2 optimizer explicitly.
         for parameter in self.model.encoder_q.fc.parameters():
             parameter.requires_grad = False
         self._stage2_resumed = False
+        self._stage2_diagnostic_reference = {}
 
     def load_optimizer(self):
         backbone_parameters = []
@@ -202,6 +236,304 @@ class OSEResAStage2Processor(OSEResAProcessor):
         self.train_writer.add_scalar(
             'head_lr', self.head_lr, self.global_step)
 
+    @staticmethod
+    def _snapshot_module(module, trainable_only=False):
+        if module is None:
+            return {}
+        return {
+            name: parameter.detach().float().cpu().clone()
+            for name, parameter in module.named_parameters()
+            if not trainable_only or parameter.requires_grad
+        }
+
+    def _initialize_stage2_diagnostics(self):
+        if not self.arg.stage2_diagnostics:
+            return
+        model = self._core_model(self.model)
+        self._stage2_diagnostic_reference = {
+            'encoder': self._snapshot_module(
+                model.encoder_q, trainable_only=True),
+            'resa_projector': self._snapshot_module(model.projector_q),
+            'predictor': self._snapshot_module(model.predictor),
+            'ose_projector': self._snapshot_module(
+                model.ose_projector_q
+                if model.ose_separate_projector else None),
+        }
+        self._stage2_diagnostic_path = os.path.join(
+            self.arg.work_dir, self.arg.stage2_diagnostic_filename)
+        fresh_run = not self.arg.weights and int(self.arg.start_epoch) == 0
+        mode = 'w' if fresh_run else 'a'
+        needs_header = (
+            mode == 'w' or not os.path.isfile(self._stage2_diagnostic_path) or
+            os.path.getsize(self._stage2_diagnostic_path) == 0)
+        with open(self._stage2_diagnostic_path, mode, newline='') as handle:
+            if needs_header:
+                writer = csv.DictWriter(
+                    handle, fieldnames=_STAGE2_DIAGNOSTIC_FIELDS)
+                writer.writeheader()
+        self.io.print_log(
+            'Stage2 diagnostics | epoch CSV {}'.format(
+                self._stage2_diagnostic_path))
+
+    @staticmethod
+    def _module_trainable_parameters(module):
+        if module is None:
+            return []
+        return [
+            parameter for parameter in module.parameters()
+            if parameter.requires_grad
+        ]
+
+    @staticmethod
+    def _gradient_map(objective, parameters):
+        if objective is None or not objective.requires_grad:
+            return {}
+        gradients = torch.autograd.grad(
+            objective, parameters, retain_graph=True, allow_unused=True)
+        result = {}
+        for parameter, gradient in zip(parameters, gradients):
+            if gradient is not None:
+                # Diagnostics run once per epoch. Moving these detached
+                # gradients to CPU avoids retaining two full GPU gradient maps.
+                result[id(parameter)] = gradient.detach().float().cpu()
+        return result
+
+    @staticmethod
+    def _mapped_gradient_norm(gradient_map, parameters):
+        squared = 0.0
+        found = False
+        for parameter in parameters:
+            gradient = gradient_map.get(id(parameter))
+            if gradient is None:
+                continue
+            squared += float(torch.sum(gradient * gradient).item())
+            found = True
+        return math.sqrt(squared) if found else 0.0
+
+    @staticmethod
+    def _mapped_gradient_cosine(left_map, right_map, parameters):
+        dot = 0.0
+        left_squared = 0.0
+        right_squared = 0.0
+        found = False
+        for parameter in parameters:
+            left = left_map.get(id(parameter))
+            right = right_map.get(id(parameter))
+            if left is None or right is None:
+                continue
+            dot += float(torch.sum(left * right).item())
+            left_squared += float(torch.sum(left * left).item())
+            right_squared += float(torch.sum(right * right).item())
+            found = True
+        if not found or left_squared <= 0.0 or right_squared <= 0.0:
+            return float('nan')
+        return dot / math.sqrt(left_squared * right_squared)
+
+    @staticmethod
+    def _actual_gradient_norm(parameters):
+        squared = 0.0
+        found = False
+        for parameter in parameters:
+            if parameter.grad is None:
+                continue
+            gradient = parameter.grad.detach().float()
+            squared += float(torch.sum(gradient * gradient).item())
+            found = True
+        return math.sqrt(squared) if found else 0.0
+
+    def _diagnostic_parameter_groups(self):
+        model = self._core_model(self.model)
+        encoder = self._module_trainable_parameters(model.encoder_q)
+        resa_projector = self._module_trainable_parameters(model.projector_q)
+        predictor = self._module_trainable_parameters(model.predictor)
+        ose_projector = (
+            self._module_trainable_parameters(model.ose_projector_q)
+            if model.ose_separate_projector else resa_projector)
+        all_parameters = []
+        seen = set()
+        for group in (encoder, resa_projector, predictor, ose_projector):
+            for parameter in group:
+                if id(parameter) not in seen:
+                    all_parameters.append(parameter)
+                    seen.add(id(parameter))
+        return {
+            'all': all_parameters,
+            'encoder': encoder,
+            'resa_projector': resa_projector,
+            'ose_projector': ose_projector,
+            'predictor': predictor,
+            'separate': bool(model.ose_separate_projector),
+        }
+
+    def _diagnostics_epoch_start(self, epoch):
+        if not self.arg.stage2_diagnostics:
+            return
+        self._stage2_diagnostic_sums = {
+            name: 0.0 for name in _STAGE2_MEAN_METRICS}
+        self._stage2_diagnostic_counts = {
+            name: 0 for name in _STAGE2_MEAN_METRICS}
+        self._stage2_gradient_diagnostics = {}
+        self._stage2_diagnostic_batches = 0
+
+    def _diagnostics_before_backward(self, batch_index, resa_objective,
+                                     ose_objective):
+        if (not self.arg.stage2_diagnostics or
+                not self.arg.stage2_diagnostic_gradients or
+                batch_index != 0):
+            return {}
+        groups = self._diagnostic_parameter_groups()
+        resa_gradients = self._gradient_map(
+            resa_objective, groups['all'])
+        ose_gradients = self._gradient_map(
+            ose_objective, groups['all'])
+        diagnostics = {
+            'resa_encoder_grad_norm': self._mapped_gradient_norm(
+                resa_gradients, groups['encoder']),
+            'ose_encoder_grad_norm': self._mapped_gradient_norm(
+                ose_gradients, groups['encoder']),
+            'encoder_grad_cos': self._mapped_gradient_cosine(
+                resa_gradients, ose_gradients, groups['encoder']),
+            'resa_projector_grad_norm': self._mapped_gradient_norm(
+                resa_gradients, groups['resa_projector']),
+            'ose_projector_grad_norm': self._mapped_gradient_norm(
+                ose_gradients, groups['ose_projector']),
+            'shared_projector_grad_cos': (
+                self._mapped_gradient_cosine(
+                    resa_gradients, ose_gradients,
+                    groups['resa_projector'])
+                if not groups['separate'] else float('nan')),
+            'resa_predictor_grad_norm': self._mapped_gradient_norm(
+                resa_gradients, groups['predictor']),
+        }
+        return diagnostics
+
+    def _diagnostics_after_backward(self, batch_index):
+        if (not self.arg.stage2_diagnostics or
+                not self.arg.stage2_diagnostic_gradients or
+                batch_index != 0):
+            return {}
+        groups = self._diagnostic_parameter_groups()
+        return {
+            'actual_encoder_grad_norm': self._actual_gradient_norm(
+                groups['encoder']),
+            'actual_resa_projector_grad_norm': self._actual_gradient_norm(
+                groups['resa_projector']),
+            'actual_ose_projector_grad_norm': self._actual_gradient_norm(
+                groups['ose_projector']),
+            'actual_predictor_grad_norm': self._actual_gradient_norm(
+                groups['predictor']),
+        }
+
+    @staticmethod
+    def _finite_scalar(value):
+        if torch.is_tensor(value):
+            if value.numel() != 1:
+                return None
+            value = float(value.detach().item())
+        else:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return None
+        return value if math.isfinite(value) else None
+
+    def _diagnostics_record_batch(self, epoch, losses, total_loss,
+                                  diagnostics):
+        if not self.arg.stage2_diagnostics:
+            return
+        values = {'loss': total_loss}
+        values.update(losses)
+        for name in _STAGE2_MEAN_METRICS:
+            value = self._finite_scalar(values.get(name))
+            if value is None:
+                continue
+            self._stage2_diagnostic_sums[name] += value
+            self._stage2_diagnostic_counts[name] += 1
+        if diagnostics:
+            self._stage2_gradient_diagnostics.update(diagnostics)
+        self._stage2_diagnostic_batches += 1
+
+    @staticmethod
+    def _module_parameter_drift(module, reference):
+        if module is None or not reference:
+            return float('nan')
+        numerator = 0.0
+        denominator = 0.0
+        for name, parameter in module.named_parameters():
+            if name not in reference:
+                continue
+            current = parameter.detach().float().cpu()
+            initial = reference[name]
+            difference = current - initial
+            numerator += float(torch.sum(difference * difference).item())
+            denominator += float(torch.sum(initial * initial).item())
+        if denominator <= 0.0:
+            return float('nan')
+        return math.sqrt(numerator / denominator)
+
+    def _diagnostics_epoch_end(self, epoch):
+        if not self.arg.stage2_diagnostics:
+            return
+        model = self._core_model(self.model)
+        if not hasattr(self, '_stage2_diagnostic_path'):
+            raise RuntimeError('Stage2 diagnostics were not initialized')
+        if not self.arg.ose_enabled:
+            training_mode = 'resa_only'
+        elif self.arg.resa_weight == 0:
+            training_mode = 'ose_only'
+        elif model.ose_separate_projector:
+            training_mode = 'resa_ose_separate_projector'
+        else:
+            training_mode = 'resa_ose_shared_projector'
+        row = {
+            'epoch': int(epoch),
+            'training_mode': training_mode,
+            'ose_enabled': int(bool(self.arg.ose_enabled)),
+            'separate_projector': int(model.ose_separate_projector),
+            'resa_weight': float(self.arg.resa_weight),
+            'batches': int(self._stage2_diagnostic_batches),
+            'backbone_lr': float(self.lr),
+            'head_lr': float(self.head_lr),
+        }
+        for name in _STAGE2_MEAN_METRICS:
+            count = self._stage2_diagnostic_counts[name]
+            row['mean_' + name] = (
+                self._stage2_diagnostic_sums[name] / count
+                if count > 0 else float('nan'))
+        for name in _STAGE2_GRADIENT_METRICS:
+            row['first_batch_' + name] = (
+                self._stage2_gradient_diagnostics.get(
+                    name, float('nan')))
+        reference = self._stage2_diagnostic_reference
+        row['encoder_param_drift'] = self._module_parameter_drift(
+            model.encoder_q, reference.get('encoder', {}))
+        row['resa_projector_param_drift'] = self._module_parameter_drift(
+            model.projector_q, reference.get('resa_projector', {}))
+        row['predictor_param_drift'] = self._module_parameter_drift(
+            model.predictor, reference.get('predictor', {}))
+        row['ose_projector_param_drift'] = self._module_parameter_drift(
+            model.ose_projector_q if model.ose_separate_projector else None,
+            reference.get('ose_projector', {}))
+        with open(self._stage2_diagnostic_path, 'a', newline='') as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=_STAGE2_DIAGNOSTIC_FIELDS,
+                extrasaction='ignore')
+            writer.writerow(row)
+        for name, value in row.items():
+            if name.startswith('mean_') or name.endswith('_param_drift'):
+                scalar = self._finite_scalar(value)
+                if scalar is not None:
+                    self.train_writer.add_scalar(
+                        'stage2_diag/' + name, scalar, epoch)
+        self.io.print_log(
+            'Stage2 diagnostic epoch {} | cluster_kl {:.4f} | '
+            'H-ReSA relation {:.4f} | encoder grad cosine {}'.format(
+                epoch, row['mean_cluster_kl'],
+                row['mean_encoder_resa_relation_cos'],
+                '{:.4f}'.format(row['first_batch_encoder_grad_cos'])
+                if math.isfinite(row['first_batch_encoder_grad_cos'])
+                else 'n/a'))
+
     def load_weights(self):
         # ``weights`` remains available for resuming a full Stage2 model.  A
         # fresh Stage2 run instead uses ``stage1_weights`` and the explicit
@@ -213,6 +545,7 @@ class OSEResAStage2Processor(OSEResAProcessor):
             self.io.print_log(
                 'Stage2 resume | full ReSA/OSE checkpoint loaded; '
                 'Stage1 transfer and queue prefill skipped')
+            self._initialize_stage2_diagnostics()
             return
 
         path = self.arg.stage1_weights
@@ -234,6 +567,7 @@ class OSEResAStage2Processor(OSEResAProcessor):
             'projector tensors {} | AimCLR queue discarded'.format(
                 report['source'], report['backbone_tensors'],
                 report['projector_tensors']))
+        self._initialize_stage2_diagnostics()
 
     def load_data(self):
         super().load_data()
@@ -328,4 +662,14 @@ class OSEResAStage2Processor(OSEResAProcessor):
         parser.add_argument('--stage2_head_lr', type=float, default=0.01)
         parser.add_argument(
             '--stage2_head_final_lr', type=float, default=0.0)
+        parser.add_argument(
+            '--stage2_diagnostics', type=str2bool, default=True,
+            help='write one row of Stage2 transition diagnostics per epoch')
+        parser.add_argument(
+            '--stage2_diagnostic_gradients', type=str2bool, default=True,
+            help='measure ReSA/OSE gradient norms and cosine on the first '
+                 'batch of each epoch')
+        parser.add_argument(
+            '--stage2_diagnostic_filename', type=str,
+            default='stage2_diagnostics.csv')
         return parser

@@ -169,6 +169,60 @@ class OSEResALmixTest(unittest.TestCase):
             parameter.grad is None
             for parameter in model.projector_k.parameters()))
 
+    def test_separate_ose_projector_isolates_head_gradients(self):
+        model = OSEResA(
+            base_encoder='tests.test_ose_resa_lmix.TinyEncoder',
+            pretrain=True,
+            feature_dim=6,
+            projector_hidden_dim=12,
+            projector_layers=2,
+            use_predictor=True,
+            ose_enabled=True,
+            ose_separate_projector=True,
+            queue_size=8,
+            hidden_dim=8,
+            num_class=self.num_classes,
+            dropout=0.0)
+        model.train()
+        with torch.no_grad():
+            for shared, ose in zip(
+                    model.projector_q.parameters(),
+                    model.ose_projector_q.parameters()):
+                self.assertTrue(torch.equal(shared, ose))
+            for online, teacher in zip(
+                    model.ose_projector_q.parameters(),
+                    model.ose_projector_k.parameters()):
+                self.assertTrue(torch.equal(online, teacher))
+
+        losses = model(
+            self.view_a, self.view_b, self.exemplar,
+            sample_indices=self.sample_indices,
+            ose_topk=0,
+            extra_exemplar_views=self.extra_exemplar_views)
+        losses['proto'].backward()
+
+        self.assertTrue(any(
+            parameter.grad is not None
+            for parameter in model.ose_projector_q.parameters()))
+        self.assertTrue(all(
+            parameter.grad is None
+            for parameter in model.projector_q.parameters()))
+        self.assertTrue(all(
+            parameter.grad is None
+            for parameter in model.predictor.parameters()))
+        self.assertIsNotNone(model.encoder_q.input_layer.weight.grad)
+        self.assertAlmostEqual(
+            losses['resa_ose_relation_cos'].item(), 1.0, places=6)
+
+    def test_shared_projector_reports_identical_ose_relation(self):
+        model = self._model()
+        losses = model(
+            self.view_a, self.view_b, self.exemplar,
+            sample_indices=self.sample_indices,
+            ose_topk=0)
+        self.assertAlmostEqual(
+            losses['resa_ose_relation_cos'].item(), 1.0, places=6)
+
 
 if __name__ == '__main__':
     unittest.main()

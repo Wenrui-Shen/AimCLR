@@ -1,0 +1,80 @@
+work_dir: ./data/ntu60_cs/aimclr_to_native_resa_only_100ep_joint/pretext
+
+# ReSA-only contribution control. It excludes the exact same 60 exemplars as
+# the OSE runs so the unlabeled training split remains identical.
+stage1_weights: ./data/ntu60_cs/aimclr_joint/pretext/epoch300_model.pt
+stage2_load_projector: False
+stage2_prefill_queue: False
+stage2_head_lr: 0.25
+stage2_head_final_lr: 0.0
+stage2_diagnostics: True
+stage2_diagnostic_gradients: True
+stage2_diagnostic_filename: stage2_diagnostics.csv
+
+train_feeder: feeder.ose_resa_feeder.Feeder
+train_feeder_args:
+  data_path: ../data/pstl/xsub/train_position.npy
+  label_path: ../data/pstl/xsub/train_label.pkl
+  shear_amplitude: 0.5
+  temperal_padding_ratio: 6
+  augmentation_methods: [temporal_crop, shear, rotation]
+  augmentation_probability: 0.5
+  mmap: True
+  return_index: True
+
+model: net.ose_resa.OSEResA
+model_args:
+  base_encoder: net.st_gcn.Model
+  pretrain: True
+  feature_dim: 256
+  projector_type: resa
+  projector_hidden_dim: 2048
+  projector_layers: 3
+  use_predictor: True
+  ose_separate_projector: False
+  cluster_temperature: 0.4
+  sinkhorn_temperature: 0.05
+  sinkhorn_iterations: 3
+  in_channels: 3
+  hidden_channels: 16
+  hidden_dim: 256
+  num_class: 60
+  dropout: 0.0
+  graph_args:
+    layout: 'ntu-rgb+d'
+    strategy: 'spatial'
+  edge_importance_weighting: True
+
+nesterov: False
+weight_decay: 1e-5
+base_lr: 0.25
+resa_final_lr: 0.0
+resa_warmup_epoch: 0
+resa_momentum: 0.996
+resa_weight: 1.0
+optimizer: SGD
+
+device: [0]
+batch_size: 128
+test_batch_size: 128
+num_epoch: 100
+start_epoch: 0
+stream: 'joint'
+
+ose_enabled: False
+ose_num_class: 60
+ose_exemplar_seed: 0
+ose_exemplar_index_path: ./data/ntu60_cs/ose_resa_shared/exemplar_seed0.npy
+ose_exclude_exemplars: True
+ose_match_exemplar_split: True
+ose_topk: 0
+ose_prototype_stage: 1
+ose_exemplar_views: 1
+ose_exemplar_modalities: [joint]
+ose_lambda: 0.0
+ose_mix_proto_weight: 0.0
+ose_mix_ins_weight: 0.0
+queue_contrast_weight: 0.0
+
+save_interval: 10
+eval_interval: -1

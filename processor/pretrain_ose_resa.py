@@ -54,6 +54,11 @@ class OSEResAProcessor(PT_Processor):
             raise ValueError('ose_mix_proto_weight must be non-negative')
         if self.arg.ose_mix_ins_weight < 0:
             raise ValueError('ose_mix_ins_weight must be non-negative')
+        if self.arg.resa_weight < 0:
+            raise ValueError('resa_weight must be non-negative')
+        if self.arg.resa_weight == 0 and not self.arg.ose_enabled:
+            raise ValueError(
+                'At least one of ReSA or OSE must be enabled')
         if self.arg.ose_topk < 0:
             raise ValueError('ose_topk must be non-negative')
         if self.arg.ose_exemplar_views < 1:
@@ -97,6 +102,8 @@ class OSEResAProcessor(PT_Processor):
         self.model.reset_momentum_encoder()
         if not self.arg.ose_enabled:
             mode = 'ReSA-only'
+        elif self.arg.resa_weight == 0:
+            mode = 'OSE-only'
         elif mix_enabled and queue_contrast_enabled:
             mode = 'ReSA+Lproto+Lmix+Lqueue-corr'
         elif mix_enabled:
@@ -107,6 +114,18 @@ class OSEResAProcessor(PT_Processor):
             mode = 'ReSA+Lproto'
         self.io.print_log('Training mode | {} | OSE {}'.format(
             mode, 'enabled' if self.arg.ose_enabled else 'disabled'))
+        self.io.print_log(
+            'Loss weights | ReSA {:.4f} | OSE prototype {:.4f}'.format(
+                self.arg.resa_weight, self.arg.ose_lambda))
+        if self.arg.ose_match_exemplar_split and not self.arg.ose_enabled:
+            self.io.print_log(
+                'ReSA-only split | exclude the same one-shot exemplars as '
+                'OSE ablations')
+        if self.arg.ose_enabled:
+            projector_mode = ('separate ReSA/OSE projectors'
+                              if self.model.ose_separate_projector
+                              else 'shared ReSA/OSE projector')
+            self.io.print_log('Projector mode | {}'.format(projector_mode))
         if self.arg.ose_enabled:
             self.io.print_log(
                 'OSE mix | proto_weight {:.4f} | ins_weight {:.4f} | '
@@ -149,7 +168,7 @@ class OSEResAProcessor(PT_Processor):
 
     def load_data(self):
         super().load_data()
-        if self.arg.ose_enabled:
+        if self.arg.ose_enabled or self.arg.ose_match_exemplar_split:
             self._select_exemplars()
             if self.arg.ose_exclude_exemplars:
                 self._exclude_exemplars_from_unlabeled_loader()
@@ -173,7 +192,7 @@ class OSEResAProcessor(PT_Processor):
     def _select_exemplars(self):
         dataset = self.data_loader['train'].dataset
         if not hasattr(dataset, 'label'):
-            raise ValueError('ReSA+Lproto requires labels for exemplar selection')
+            raise ValueError('Exemplar selection requires dataset labels')
         if not getattr(dataset, 'return_index', False):
             raise ValueError(
                 'OSE neighbor diagnostics require train_feeder_args.'
@@ -372,10 +391,30 @@ class OSEResAProcessor(PT_Processor):
         return 1.0 - (1.0 - self.arg.resa_momentum) * (
             math.cos(math.pi * progress) + 1.0) / 2.0
 
+    # Stage2 overrides these hooks to collect transition diagnostics without
+    # duplicating the ReSA/OSE training loop used by the from-scratch model.
+    def _diagnostics_epoch_start(self, epoch):
+        pass
+
+    def _diagnostics_before_backward(self, batch_index, resa_objective,
+                                     ose_objective):
+        return {}
+
+    def _diagnostics_after_backward(self, batch_index):
+        return {}
+
+    def _diagnostics_record_batch(self, epoch, losses, total_loss,
+                                  diagnostics):
+        pass
+
+    def _diagnostics_epoch_end(self, epoch):
+        pass
+
     def train(self, epoch):
         self.model.train()
         loader = self.data_loader['train']
         loss_values = []
+        self._diagnostics_epoch_start(epoch)
         if self.arg.ose_enabled:
             neighbor_correct = np.zeros(
                 len(self.ose_class_ids), dtype=np.int64)
@@ -446,20 +485,22 @@ class OSEResAProcessor(PT_Processor):
                     compute_mix_proto=compute_mix_proto,
                     compute_mix_ins=compute_mix_ins,
                     extra_exemplar_views=exemplar_views[1:])
-                loss = (losses['cluster'] +
-                        self.arg.ose_lambda * losses['proto'])
+                ose_objective = self.arg.ose_lambda * losses['proto']
                 if compute_mix_proto:
-                    loss = (
-                        loss + self.arg.ose_mix_proto_weight *
+                    ose_objective = (
+                        ose_objective + self.arg.ose_mix_proto_weight *
                         losses['mix_proto'])
                 if compute_mix_ins:
-                    loss = (
-                        loss + self.arg.ose_mix_ins_weight *
+                    ose_objective = (
+                        ose_objective + self.arg.ose_mix_ins_weight *
                         losses['mix_ins'])
                 if self.arg.queue_contrast_weight > 0:
-                    loss = (
-                        loss + self.arg.queue_contrast_weight *
+                    ose_objective = (
+                        ose_objective + self.arg.queue_contrast_weight *
                         losses['queue_corr'])
+                resa_objective = losses['cluster']
+                loss = (self.arg.resa_weight * resa_objective +
+                        ose_objective)
 
                 selected_indices = losses[
                     'neighbor_sample_indices'].detach().cpu().numpy()
@@ -492,10 +533,16 @@ class OSEResAProcessor(PT_Processor):
             else:
                 losses = self.model(
                     view_a, view_b, momentum=momentum)
-                loss = losses['cluster']
+                resa_objective = losses['cluster']
+                ose_objective = None
+                loss = self.arg.resa_weight * resa_objective
 
             self.optimizer.zero_grad()
+            diagnostics = self._diagnostics_before_backward(
+                batch_index, resa_objective, ose_objective)
             loss.backward()
+            diagnostics.update(
+                self._diagnostics_after_backward(batch_index))
             self.optimizer.step()
 
             self.iter_info['loss'] = loss.item()
@@ -530,6 +577,8 @@ class OSEResAProcessor(PT_Processor):
                         losses['instance_queue_ptr'].item())
             self.iter_info['ema_m'] = '{:.6f}'.format(momentum)
             self.iter_info['lr'] = '{:.6f}'.format(self.lr)
+            self._diagnostics_record_batch(
+                epoch, losses, loss, diagnostics)
             loss_values.append(loss.item())
             self.show_iter_info()
             self.meta_info['iter'] += 1
@@ -544,6 +593,7 @@ class OSEResAProcessor(PT_Processor):
         self.epoch_info['train_mean_loss'] = np.mean(loss_values)
         self.train_writer.add_scalar(
             'loss', self.epoch_info['train_mean_loss'], epoch)
+        self._diagnostics_epoch_end(epoch)
         if not self.arg.ose_enabled:
             self.show_epoch_info()
             return
@@ -598,12 +648,16 @@ class OSEResAProcessor(PT_Processor):
         parser.add_argument('--resa_momentum', type=float, default=0.996)
         parser.add_argument('--resa_warmup_epoch', type=int, default=2)
         parser.add_argument('--resa_final_lr', type=float, default=0.0)
+        parser.add_argument('--resa_weight', type=float, default=1.0)
         parser.add_argument('--ose_enabled', type=str2bool, default=True)
         parser.add_argument('--ose_num_class', type=int, default=0)
         parser.add_argument('--ose_exemplar_seed', type=int, default=0)
         parser.add_argument('--ose_exemplar_index_path', type=str, default='')
         parser.add_argument('--ose_exclude_exemplars', type=str2bool,
                             default=True)
+        parser.add_argument(
+            '--ose_match_exemplar_split', type=str2bool, default=False,
+            help='select/exclude the same exemplars even when OSE is disabled')
         parser.add_argument('--ose_topk', type=int, default=8)
         parser.add_argument('--ose_prototype_stage', type=int, default=0)
         parser.add_argument(
