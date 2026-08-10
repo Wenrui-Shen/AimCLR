@@ -204,6 +204,32 @@ class OSEResAStage2Test(unittest.TestCase):
         self.assertTrue(torch.allclose(
             bone[:, :, :, 0], joint[:, :, :, 0] - joint[:, :, :, 1]))
 
+    def test_multi_augmentation_jmb_groups_each_share_one_draw(self):
+        processor = OSEResAStage2Processor.__new__(
+            OSEResAStage2Processor)
+        dataset = _ExemplarDataset()
+        processor.data_loader = {
+            'train': types.SimpleNamespace(dataset=dataset)}
+        processor.ose_exemplar_indices = [0, 1, 2]
+        processor.ose_exemplar_modalities = ('joint', 'motion', 'bone')
+        processor.arg = types.SimpleNamespace(
+            stream='joint', ose_exemplar_views=2)
+        processor.dev = 'cpu'
+
+        groups = processor._exemplar_view_groups()
+
+        self.assertEqual(len(groups), 2)
+        self.assertTrue(all(len(group) == 3 for group in groups))
+        self.assertEqual(dataset.augmentation_calls, 6)
+        for joint, motion, bone in groups:
+            self.assertTrue(torch.allclose(
+                motion[:, :, :-1], joint[:, :, 1:] - joint[:, :, :-1]))
+            self.assertTrue(torch.count_nonzero(
+                motion[:, :, -1]).item() == 0)
+            self.assertTrue(torch.allclose(
+                bone[:, :, :, 0],
+                joint[:, :, :, 0] - joint[:, :, :, 1]))
+
     def test_dual_projector_gradient_diagnostic_localizes_conflict(self):
         processor = OSEResAStage2Processor.__new__(
             OSEResAStage2Processor)

@@ -291,6 +291,18 @@ class OSEResA(nn.Module):
         fused = torch.sum(weights.unsqueeze(2) * components, dim=1)
         return F.normalize(fused, dim=1)
 
+    @staticmethod
+    def _ensemble_labeled_exemplars(fused_exemplar_z):
+        """Average complete per-augmentation prototypes for each class."""
+        if fused_exemplar_z.dim() != 3:
+            raise ValueError(
+                'Fused exemplar embeddings must have shape [C, K, D]')
+        if fused_exemplar_z.size(1) < 1:
+            raise ValueError('At least one exemplar augmentation is required')
+        fused_exemplar_z = F.normalize(fused_exemplar_z, dim=2)
+        return F.normalize(fused_exemplar_z.mean(dim=1), dim=1)
+
+
     def _class_prototypes(self, exemplar_z, topk, alpha,
                           extra_exemplar_z=None):
         # Build the label-only prototype first. It becomes the actual anchor
@@ -573,8 +585,37 @@ class OSEResA(nn.Module):
         return ([view_a_features, view_b_features], features,
                 projections, predictions, ose_projections)
 
-    def _exemplar_embedding(self, exemplar):
-        return self._online_projection(exemplar, ose_branch=True)
+    def _exemplar_embedding(self, exemplar, preserve_bn=False):
+        if not preserve_bn:
+            return self._online_projection(exemplar, ose_branch=True)
+
+        projector = (self.ose_projector_q
+                     if self.ose_separate_projector
+                     else self.projector_q)
+        batch_norm_state = []
+        for module in (self.encoder_q, projector):
+            for child in module.modules():
+                if isinstance(child, (
+                        nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    batch_norm_state.append((
+                        child,
+                        (child.running_mean.clone()
+                         if child.running_mean is not None else None),
+                        (child.running_var.clone()
+                         if child.running_var is not None else None),
+                        (child.num_batches_tracked.clone()
+                         if child.num_batches_tracked is not None else None),
+                    ))
+        try:
+            return self._online_projection(exemplar, ose_branch=True)
+        finally:
+            for child, running_mean, running_var, batches in batch_norm_state:
+                if running_mean is not None:
+                    child.running_mean.copy_(running_mean)
+                if running_var is not None:
+                    child.running_var.copy_(running_var)
+                if batches is not None:
+                    child.num_batches_tracked.copy_(batches)
 
     def _online_projection(self, view, ose_branch=False):
         features = self.encoder_q.forward_features(view)
@@ -673,7 +714,8 @@ class OSEResA(nn.Module):
                 ose_tau_s=0.1, ose_tau_t=0.04,
                 sample_indices=None, mixed_view=None, mix_index=None,
                 mix_beta=None, compute_mix_proto=False,
-                compute_mix_ins=False, extra_exemplar_views=None):
+                compute_mix_ins=False, extra_exemplar_views=None,
+                extra_exemplar_groups=None):
         if not self.pretrain:
             return self.encoder_q(view_a)
         if view_b is None:
@@ -707,6 +749,27 @@ class OSEResA(nn.Module):
                 if extra_view.size(0) != exemplar.size(0):
                     raise ValueError(
                         'All exemplar views must contain the same classes')
+            if extra_exemplar_groups is None:
+                extra_exemplar_groups = []
+            if not isinstance(extra_exemplar_groups, (tuple, list)):
+                raise ValueError(
+                    'extra_exemplar_groups must be a list or tuple')
+            extra_group_anchor_z = []
+            for group in extra_exemplar_groups:
+                if not isinstance(group, (tuple, list)) or not group:
+                    raise ValueError(
+                        'Each exemplar group must be a non-empty list or tuple')
+                if len(group) != 1 + len(extra_exemplar_views):
+                    raise ValueError(
+                        'All exemplar groups must contain the same modalities')
+                for group_view in group:
+                    if group_view.size(0) != exemplar.size(0):
+                        raise ValueError(
+                            'All exemplar groups must contain the same classes')
+                # Each independently augmented group keeps the branch
+                # semantics: Joint is online; structural extras are EMA.
+                extra_group_anchor_z.append(
+                    self._exemplar_embedding(group[0], preserve_bn=True))
         with torch.no_grad():
             self._momentum_update(momentum)
             (teacher_raw_h, teacher_h, teacher_z,
@@ -718,6 +781,29 @@ class OSEResA(nn.Module):
                 ], dim=1)
             else:
                 extra_exemplar_z = None
+            if self.ose_enabled:
+                extra_group_z = []
+                for group in extra_exemplar_groups:
+                    if len(group) > 1:
+                        group_extra_z = torch.stack([
+                            self._teacher_exemplar_projection(extra_view)
+                            for extra_view in group[1:]
+                        ], dim=1)
+                    else:
+                        group_extra_z = None
+                    extra_group_z.append(group_extra_z)
+
+        if self.ose_enabled and extra_exemplar_groups:
+            fused_groups = [self._fuse_labeled_exemplars(
+                exemplar_z, extra_exemplar_z)]
+            fused_groups.extend([
+                self._fuse_labeled_exemplars(anchor_z, group_z)
+                for anchor_z, group_z in zip(
+                    extra_group_anchor_z, extra_group_z)
+            ])
+            exemplar_z = self._ensemble_labeled_exemplars(
+                torch.stack(fused_groups, dim=1))
+            extra_exemplar_z = None
 
         assignment = self._sinkhorn_knopp(
             torch.matmul(online_h[0].detach(), teacher_h[0].t()))

@@ -169,6 +169,54 @@ class OSEResALmixTest(unittest.TestCase):
             parameter.grad is None
             for parameter in model.projector_k.parameters()))
 
+    def test_multi_augmentation_jmb_ensembles_complete_groups(self):
+        model = self._model()
+        model.train()
+        teacher_projector_bn = model.projector_k[1]
+        online_projector_bn = model.projector_q[1]
+        second_group = [
+            torch.randn(self.num_classes, 3, 4, 5, 1)
+            for _ in range(3)]
+        losses = model(
+            self.view_a, self.view_b, self.exemplar,
+            sample_indices=self.sample_indices,
+            ose_topk=0,
+            extra_exemplar_views=self.extra_exemplar_views[:2],
+            extra_exemplar_groups=[second_group])
+
+        self.assertTrue(torch.isfinite(losses['proto']))
+        self.assertEqual(
+            tuple(losses['neighbor_sample_indices'].shape),
+            (self.num_classes, 0))
+        # Two training views plus two online Joint exemplar augmentations.
+        self.assertEqual(model.encoder_q.forward_feature_calls, 4)
+        # Two teacher views plus Motion/Bone for both augmentations.
+        self.assertEqual(model.encoder_k.forward_feature_calls, 6)
+        self.assertEqual(
+            teacher_projector_bn.num_batches_tracked.item(), 2)
+        self.assertEqual(
+            online_projector_bn.num_batches_tracked.item(), 3)
+
+        losses['proto'].backward()
+        self.assertIsNotNone(model.encoder_q.input_layer.weight.grad)
+        self.assertTrue(all(
+            parameter.grad is None
+            for parameter in model.encoder_k.parameters()))
+
+    def test_exemplar_ensemble_is_normalized_mean(self):
+        fused = torch.tensor([
+            [[1.0, 0.0], [0.0, 1.0]],
+            [[1.0, 1.0], [1.0, -1.0]],
+        ])
+        actual = OSEResA._ensemble_labeled_exemplars(fused)
+        expected = torch.nn.functional.normalize(
+            torch.nn.functional.normalize(fused, dim=2).mean(dim=1),
+            dim=1)
+
+        self.assertTrue(torch.allclose(actual, expected))
+        self.assertTrue(torch.allclose(
+            actual.norm(dim=1), torch.ones(2), atol=1e-6))
+
     def test_separate_ose_projector_isolates_head_gradients(self):
         model = OSEResA(
             base_encoder='tests.test_ose_resa_lmix.TinyEncoder',

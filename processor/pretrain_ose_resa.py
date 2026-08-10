@@ -135,11 +135,13 @@ class OSEResAProcessor(PT_Processor):
                     self.arg.ose_mix_alpha))
             self.io.print_log(
                 'OSE prototype | stage P{} | queue_neighbors {} | '
-                'exemplar_views {} (1 online + {} EMA)'.format(
+                'exemplar_augmentations {} '
+                '(each: 1 online {} + {} EMA structural views)'.format(
                     self.arg.ose_prototype_stage,
                     self.arg.ose_topk,
                     self.arg.ose_exemplar_views,
-                    self.arg.ose_exemplar_views - 1))
+                    self.arg.stream,
+                    len(self.ose_exemplar_modalities) - 1))
             ema_modalities = [
                 name for name in self.ose_exemplar_modalities
                 if name != self.arg.stream
@@ -349,24 +351,30 @@ class OSEResAProcessor(PT_Processor):
         return self._prepare_stream(
             self._raw_exemplar_batch(), stream=stream)
 
+    def _exemplar_view_groups(self):
+        """Build independent augmentations with aligned structural streams.
+
+        Every group starts from one independently augmented copy of the same
+        labeled exemplar set. Joint/motion/bone are then derived from that
+        shared raw draw, so augmentation and structural modality are never
+        confounded. ose_exemplar_views is the number of complete groups.
+        """
+        groups = []
+        for _ in range(self.arg.ose_exemplar_views):
+            raw_exemplars = self._raw_exemplar_batch()
+            group = [self._prepare_stream(
+                raw_exemplars, stream=self.arg.stream)]
+            group.extend([
+                self._prepare_stream(raw_exemplars, stream=modality)
+                for modality in self.ose_exemplar_modalities
+                if modality != self.arg.stream
+            ])
+            groups.append(group)
+        return groups
+
     def _exemplar_batches(self):
-        # Derive all structural modalities from the same augmented exemplar;
-        # otherwise random augmentation would be confounded with modality.
-        raw_exemplars = self._raw_exemplar_batch()
-        batches = [self._prepare_stream(
-            raw_exemplars, stream=self.arg.stream)]
-        batches.extend([
-            self._prepare_stream(raw_exemplars, stream=modality)
-            for modality in self.ose_exemplar_modalities
-            if modality != self.arg.stream
-        ])
-        # Preserve the older independent-view option in addition to the new
-        # deterministic structural modalities.
-        batches.extend([
-            self._exemplar_batch(stream=self.arg.stream)
-            for _ in range(self.arg.ose_exemplar_views - 1)
-        ])
-        return batches
+        """Return the first complete group for legacy callers and tests."""
+        return self._exemplar_view_groups()[0]
 
     def _training_progress(self, epoch, batch_index, num_batches):
         return (epoch - 1) + float(batch_index + 1) / max(num_batches, 1)
@@ -470,8 +478,8 @@ class OSEResAProcessor(PT_Processor):
             momentum = self._momentum(progress)
 
             if self.arg.ose_enabled:
-                exemplar_views = self._exemplar_batches()
-                exemplar = exemplar_views[0]
+                exemplar_groups = self._exemplar_view_groups()
+                exemplar = exemplar_groups[0][0]
                 losses = self.model(
                     view_a, view_b, exemplar,
                     momentum=momentum, ose_topk=self.arg.ose_topk,
@@ -484,7 +492,8 @@ class OSEResAProcessor(PT_Processor):
                     mix_beta=mix_beta,
                     compute_mix_proto=compute_mix_proto,
                     compute_mix_ins=compute_mix_ins,
-                    extra_exemplar_views=exemplar_views[1:])
+                    extra_exemplar_views=exemplar_groups[0][1:],
+                    extra_exemplar_groups=exemplar_groups[1:])
                 ose_objective = self.arg.ose_lambda * losses['proto']
                 if compute_mix_proto:
                     ose_objective = (
@@ -662,7 +671,8 @@ class OSEResAProcessor(PT_Processor):
         parser.add_argument('--ose_prototype_stage', type=int, default=0)
         parser.add_argument(
             '--ose_exemplar_views', type=int, default=1,
-            help='total weak exemplar views: one online plus EMA views')
+            help='number of independent exemplar augmentations; every '
+                 'augmentation constructs one complete structural prototype')
         parser.add_argument(
             '--ose_exemplar_modalities', type=str, nargs='+',
             default=['joint'],
