@@ -3,10 +3,11 @@ set -euo pipefail
 
 # Dual JMB multi-augmentation validation.
 #
-# Default: the weakest Gate 1 exemplar seed (seed1) with two independently
-# augmented JMB groups per iteration. Each group uses one online Joint branch
-# and EMA Motion/Bone branches derived from the same augmented raw exemplar.
-# The two normalized JMB prototypes are averaged and normalized again.
+# Default: the prespecified single follow-up seed (seed0) after seed1 K=2
+# produced only a weak improvement. Two independently augmented JMB groups
+# are used per iteration. Each group uses one online Joint branch and EMA
+# Motion/Bone branches derived from the same augmented raw exemplar. The two
+# normalized JMB prototypes are averaged and normalized again.
 #
 # Usage:
 #   bash run_stage2_dual_jmb_multiaug.sh
@@ -15,7 +16,7 @@ set -euo pipefail
 #   bash run_stage2_dual_jmb_multiaug.sh lp
 #
 # Optional:
-#   SEED=2 AUGMENTATIONS=2 PYTHON_BIN=/path/to/python \
+#   SEED=1 AUGMENTATIONS=2 PYTHON_BIN=/path/to/python \
 #     bash run_stage2_dual_jmb_multiaug.sh all
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,7 +24,7 @@ cd "${SCRIPT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_MODE="${1:-all}"
-SEED="${SEED:-1}"
+SEED="${SEED:-0}"
 AUGMENTATIONS="${AUGMENTATIONS:-2}"
 
 case "${RUN_MODE}" in
