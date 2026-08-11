@@ -597,25 +597,19 @@ class OSEResA(nn.Module):
             for child in module.modules():
                 if isinstance(child, (
                         nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                    batch_norm_state.append((
-                        child,
-                        (child.running_mean.clone()
-                         if child.running_mean is not None else None),
-                        (child.running_var.clone()
-                         if child.running_var is not None else None),
-                        (child.num_batches_tracked.clone()
-                         if child.num_batches_tracked is not None else None),
-                    ))
+                    batch_norm_state.append(
+                        (child, child.track_running_stats))
+                    # The extra online exemplar must still use batch statistics
+                    # and keep its gradient, but it must not update running
+                    # statistics. Restoring the buffers with copy_ after the
+                    # forward would invalidate the versions saved by autograd
+                    # for BatchNorm's backward pass.
+                    child.track_running_stats = False
         try:
             return self._online_projection(exemplar, ose_branch=True)
         finally:
-            for child, running_mean, running_var, batches in batch_norm_state:
-                if running_mean is not None:
-                    child.running_mean.copy_(running_mean)
-                if running_var is not None:
-                    child.running_var.copy_(running_var)
-                if batches is not None:
-                    child.num_batches_tracked.copy_(batches)
+            for child, track_running_stats in batch_norm_state:
+                child.track_running_stats = track_running_stats
 
     def _online_projection(self, view, ose_branch=False):
         features = self.encoder_q.forward_features(view)
